@@ -4,6 +4,7 @@ import time
 import signal
 import sys
 from datetime import datetime
+from functools import lru_cache
 
 # Mode: "local" (Redis) or "aws" (SQS + DynamoDB + S3)
 MODE = os.getenv("MODE", "local")
@@ -30,6 +31,28 @@ else:
     JOB_PREFIX = "job:"
 
 WORKER_ID = os.getenv("HOSTNAME", f"worker-{os.getpid()}")
+
+# Anthropic client (lazy loaded)
+_anthropic_client = None
+
+
+def get_anthropic_client():
+    """Get Anthropic client with API key from Secrets Manager or env."""
+    global _anthropic_client
+    if _anthropic_client is not None:
+        return _anthropic_client
+
+    import anthropic
+
+    if MODE == "aws":
+        secrets = boto3.client("secretsmanager", region_name=AWS_REGION)
+        response = secrets.get_secret_value(SecretId="agent-runner/anthropic-api-key")
+        api_key = response["SecretString"].strip()  # Strip whitespace
+    else:
+        api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+
+    _anthropic_client = anthropic.Anthropic(api_key=api_key)
+    return _anthropic_client
 
 # Graceful shutdown
 shutdown_requested = False
@@ -101,6 +124,48 @@ def handle_echo_job(job_id: str, payload: dict) -> dict:
     return result
 
 
+def handle_claude_chat_job(job_id: str, payload: dict) -> dict:
+    """
+    Claude chat job handler.
+
+    Payload:
+        prompt: str - The user prompt
+        system: str (optional) - System prompt
+        max_tokens: int (optional) - Max response tokens (default 1024)
+        model: str (optional) - Model to use (default claude-sonnet-4-20250514)
+    """
+    client = get_anthropic_client()
+
+    prompt = payload.get("prompt", "")
+    system = payload.get("system", "You are a helpful assistant.")
+    max_tokens = int(payload.get("max_tokens", 1024))  # Convert Decimal to int
+    model = payload.get("model", "claude-sonnet-4-20250514")
+
+    print(f"[{WORKER_ID}] Calling Claude API with model {model}...")
+
+    message = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=system,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    result = {
+        "response": message.content[0].text,
+        "model": model,
+        "usage": {
+            "input_tokens": message.usage.input_tokens,
+            "output_tokens": message.usage.output_tokens,
+        },
+        "processed_by": WORKER_ID,
+        "processed_at": datetime.utcnow().isoformat(),
+    }
+
+    print(f"[{WORKER_ID}] Claude API call complete. Tokens: {message.usage.input_tokens} in, {message.usage.output_tokens} out")
+
+    return result
+
+
 def get_job_data_aws(job_id: str) -> dict:
     response = table.get_item(Key={"job_id": job_id})
     return response.get("Item", {})
@@ -127,6 +192,8 @@ def process_job(job_id: str):
         try:
             if job_type == "echo":
                 result = handle_echo_job(job_id, payload)
+            elif job_type == "claude_chat":
+                result = handle_claude_chat_job(job_id, payload)
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
@@ -137,13 +204,17 @@ def process_job(job_id: str):
             update_job_status_aws(job_id, "SUCCEEDED", result)
 
         except Exception as e:
+            import traceback
             error_result = {
                 "error": str(e),
+                "error_type": type(e).__name__,
+                "traceback": traceback.format_exc(),
                 "worker_id": WORKER_ID,
                 "failed_at": datetime.utcnow().isoformat(),
             }
             update_job_status_aws(job_id, "FAILED", error_result)
             print(f"[{WORKER_ID}] Job {job_id} failed: {e}")
+            print(f"[{WORKER_ID}] Traceback: {traceback.format_exc()}")
 
     else:
         job_data = get_job_data_redis(job_id)
@@ -160,6 +231,8 @@ def process_job(job_id: str):
         try:
             if job_type == "echo":
                 result = handle_echo_job(job_id, payload)
+            elif job_type == "claude_chat":
+                result = handle_claude_chat_job(job_id, payload)
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 

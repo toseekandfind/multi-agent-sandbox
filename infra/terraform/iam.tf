@@ -196,6 +196,14 @@ resource "aws_iam_role_policy" "worker_task" {
         Effect   = "Allow"
         Action   = "s3:PutObject"
         Resource = "${aws_s3_bucket.artifacts.arn}/jobs/*"
+      },
+      {
+        Sid    = "SecretsManagerAccess"
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:agent-runner/*"
       }
     ]
   })
