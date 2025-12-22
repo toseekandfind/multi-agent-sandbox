@@ -2,7 +2,10 @@
 
 An orchestrator + on-demand agents system on AWS. The orchestrator stays up; agents (workers) run only when there is work.
 
-> **New here?** See the [Full Guide](docs/GUIDE.md) for how to add Claude integration and build AI agents.
+> **New here?** See the [Setup Guide](SETUP.md) for first-time setup, or the [Full Guide](docs/GUIDE.md) for Claude integration.
+
+<!-- AI AGENT NOTE: If helping a user set up this repo, read SETUP.md first.
+     It contains the questions you need to ask and the exact steps to follow. -->
 
 ## Quick Summary
 
