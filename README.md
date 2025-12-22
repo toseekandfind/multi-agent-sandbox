@@ -90,7 +90,7 @@ done
 
 ### Prerequisites
 
-- AWS CLI configured with `dan-admin` profile
+- AWS CLI configured with your preferred profile
 - Terraform 1.0+
 
 ### Deploy Infrastructure
@@ -116,7 +116,7 @@ terraform apply
 
 ```bash
 # Login to ECR
-aws ecr get-login-password --region us-east-1 --profile dan-admin | \
+aws ecr get-login-password --region us-east-1 --profile <your-profile> | \
   docker login --username AWS --password-stdin <account_id>.dkr.ecr.us-east-1.amazonaws.com
 
 # Build and push control-api
@@ -135,14 +135,14 @@ docker push <ecr_uri>/agent-runner-worker:latest
 ```bash
 # Find the orchestrator task
 TASK_ID=$(aws ecs list-tasks --cluster agent-runner --service-name orchestrator \
-  --profile dan-admin --query 'taskArns[0]' --output text | cut -d'/' -f3)
+  --profile <your-profile> --query 'taskArns[0]' --output text | cut -d'/' -f3)
 
 # Port forward via SSM
 aws ssm start-session \
   --target ecs:agent-runner_${TASK_ID}_<container_runtime_id> \
   --document-name AWS-StartPortForwardingSession \
   --parameters '{"portNumber":["8000"],"localPortNumber":["8000"]}' \
-  --profile dan-admin
+  --profile <your-profile>
 ```
 
 ---
@@ -154,11 +154,11 @@ aws ssm start-session \
 ```bash
 # Scale orchestrator to 0
 aws ecs update-service --cluster agent-runner --service orchestrator \
-  --desired-count 0 --profile dan-admin
+  --desired-count 0 --profile <your-profile>
 
 # Scale back up
 aws ecs update-service --cluster agent-runner --service orchestrator \
-  --desired-count 1 --profile dan-admin
+  --desired-count 1 --profile <your-profile>
 ```
 
 ### Destroy All Resources
@@ -202,7 +202,7 @@ echo "anthropic>=0.39.0" >> worker/requirements.txt
 aws secretsmanager create-secret \
   --name agent-runner/anthropic-api-key \
   --secret-string "sk-ant-your-key" \
-  --profile dan-admin --region us-east-1
+  --profile <your-profile> --region us-east-1
 ```
 
 ### 3. Add Claude Handler
@@ -212,8 +212,8 @@ See [docs/GUIDE.md](docs/GUIDE.md#adding-claude-integration) for the full code.
 ### 4. Rebuild & Deploy
 
 ```bash
-docker build --platform linux/amd64 -t 515705785593.dkr.ecr.us-east-1.amazonaws.com/agent-runner-worker:latest worker/
-docker push 515705785593.dkr.ecr.us-east-1.amazonaws.com/agent-runner-worker:latest
+docker build --platform linux/amd64 -t <account_id>.dkr.ecr.us-east-1.amazonaws.com/agent-runner-worker:latest worker/
+docker push <account_id>.dkr.ecr.us-east-1.amazonaws.com/agent-runner-worker:latest
 ```
 
 ### Example Claude Job

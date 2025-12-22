@@ -101,7 +101,7 @@ boto3>=1.26.0
 aws secretsmanager create-secret \
   --name agent-runner/anthropic-api-key \
   --secret-string "sk-ant-your-api-key-here" \
-  --profile dan-admin --region us-east-1
+  --profile <your-profile> --region us-east-1
 ```
 
 ### Step 3: Update IAM Policy
@@ -194,8 +194,8 @@ else:
 docker build --platform linux/amd64 -t agent-runner-worker worker/
 
 # Tag and push
-docker tag agent-runner-worker:latest 515705785593.dkr.ecr.us-east-1.amazonaws.com/agent-runner-worker:latest
-docker push 515705785593.dkr.ecr.us-east-1.amazonaws.com/agent-runner-worker:latest
+docker tag agent-runner-worker:latest <account_id>.dkr.ecr.us-east-1.amazonaws.com/agent-runner-worker:latest
+docker push <account_id>.dkr.ecr.us-east-1.amazonaws.com/agent-runner-worker:latest
 ```
 
 ---
@@ -352,7 +352,7 @@ Since there's no public inbound access, use ECS Exec:
 
 # Get task ID
 TASK_ID=$(aws ecs list-tasks --cluster agent-runner --service-name orchestrator \
-  --profile dan-admin --query 'taskArns[0]' --output text | rev | cut -d'/' -f1 | rev)
+  --profile <your-profile> --query 'taskArns[0]' --output text | rev | cut -d'/' -f1 | rev)
 
 # Execute command in container
 aws ecs execute-command \
@@ -390,11 +390,11 @@ aws ecs execute-command \
 ```bash
 # Stop all costs (except S3/DynamoDB storage)
 aws ecs update-service --cluster agent-runner --service orchestrator \
-  --desired-count 0 --profile dan-admin --region us-east-1
+  --desired-count 0 --profile <your-profile> --region us-east-1
 
 # Resume
 aws ecs update-service --cluster agent-runner --service orchestrator \
-  --desired-count 1 --profile dan-admin --region us-east-1
+  --desired-count 1 --profile <your-profile> --region us-east-1
 
 # Full cleanup
 cd infra/terraform && terraform destroy

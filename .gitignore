@@ -27,6 +27,11 @@ infra/terraform/*.tfstate
 infra/terraform/*.tfstate.*
 infra/terraform/.terraform.lock.hcl
 infra/terraform/terraform.tfvars
+infra/terraform/tfplan
+infra/terraform/*.tfplan
+
+# Claude Code local settings
+.claude/
 
 # Docker
 *.log
