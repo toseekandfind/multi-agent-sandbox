@@ -3,10 +3,13 @@ import json
 import time
 import signal
 import sys
+import sqlite3
+import subprocess
 from datetime import datetime
 from functools import lru_cache
+from pathlib import Path
 
-# Mode: "local" (Redis) or "aws" (SQS + DynamoDB + S3)
+# Mode: "local" (Redis), "aws" (SQS + DynamoDB + S3), or "vps" (SQLite + local files)
 MODE = os.getenv("MODE", "local")
 
 # AWS Configuration
@@ -14,7 +17,12 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL", "")
 DYNAMODB_TABLE = os.getenv("DYNAMODB_TABLE", "agent-jobs")
 S3_BUCKET = os.getenv("S3_BUCKET", "")
-JOB_ID_OVERRIDE = os.getenv("JOB_ID", "")  # For ECS task with specific job
+JOB_ID_OVERRIDE = os.getenv("JOB_ID", "")  # For ECS/VPS task with specific job
+
+# VPS Configuration
+WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
+VPS_DB_PATH = os.getenv("VPS_DB_PATH", "/var/lib/agent-sandbox/jobs.db")
+RESULTS_DIR = os.getenv("RESULTS_DIR", "/var/lib/agent-sandbox/results")
 
 # Initialize clients based on mode
 if MODE == "aws":
@@ -23,6 +31,14 @@ if MODE == "aws":
     dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
     s3 = boto3.client("s3", region_name=AWS_REGION)
     table = dynamodb.Table(DYNAMODB_TABLE)
+elif MODE == "vps":
+    def get_db_connection():
+        conn = sqlite3.connect(VPS_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    # Ensure results directory exists
+    Path(RESULTS_DIR).mkdir(parents=True, exist_ok=True)
 else:
     import redis
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -95,6 +111,45 @@ def update_job_status_redis(job_id: str, status: str, result: dict = None):
         updates["result"] = json.dumps(result)
     redis_client.hset(f"{JOB_PREFIX}{job_id}", mapping=updates)
     print(f"[{WORKER_ID}] Job {job_id} -> {status}")
+
+
+def update_job_status_vps(job_id: str, status: str, result: dict = None):
+    """Update job status in SQLite (VPS mode)."""
+    now = datetime.utcnow().isoformat()
+    with get_db_connection() as conn:
+        if result is not None:
+            conn.execute("""
+                UPDATE jobs SET status = ?, result = ?, updated_at = ?
+                WHERE job_id = ?
+            """, (status, json.dumps(result), now, job_id))
+        else:
+            conn.execute("""
+                UPDATE jobs SET status = ?, updated_at = ?
+                WHERE job_id = ?
+            """, (status, now, job_id))
+        conn.commit()
+    print(f"[{WORKER_ID}] Job {job_id} -> {status}")
+
+
+def update_agent_status_vps(agent_id: str, status: str):
+    """Update agent status in SQLite (VPS mode)."""
+    now = datetime.utcnow().isoformat()
+    with get_db_connection() as conn:
+        conn.execute("""
+            UPDATE agents SET status = ?, last_heartbeat = ?
+            WHERE agent_id = ?
+        """, (status, now, agent_id))
+        conn.commit()
+
+
+def save_result_to_file(job_id: str, result: dict):
+    """Save job result to local file (VPS mode)."""
+    result_dir = Path(RESULTS_DIR) / job_id
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_path = result_dir / "result.json"
+    with open(result_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"[{WORKER_ID}] Saved result to {result_path}")
 
 
 def upload_result_to_s3(job_id: str, result: dict):
@@ -306,6 +361,157 @@ def get_job_data_redis(job_id: str) -> dict:
     return redis_client.hgetall(f"{JOB_PREFIX}{job_id}")
 
 
+def get_job_data_vps(job_id: str) -> dict:
+    """Get job data from SQLite (VPS mode)."""
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+        )
+        row = cursor.fetchone()
+    if row:
+        return dict(row)
+    return {}
+
+
+def setup_workspace(job_id: str, repo_url: str, branch: str = "main") -> str:
+    """Clone a repo to the workspace directory for this job."""
+    workspace = Path(WORKSPACE_DIR) / job_id
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    # Clone the repo
+    clone_cmd = ["git", "clone", "-b", branch, repo_url, str(workspace)]
+    result = subprocess.run(clone_cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"[{WORKER_ID}] Git clone failed: {result.stderr}")
+        raise RuntimeError(f"Failed to clone repo: {result.stderr}")
+
+    print(f"[{WORKER_ID}] Cloned {repo_url} to {workspace}")
+    return str(workspace)
+
+
+def handle_agent_farm_job(job_id: str, payload: dict) -> dict:
+    """
+    Agent Farm job handler - orchestrates multiple Claude Code agents.
+
+    Payload:
+        task: str - Natural language description of the task (optional)
+        repo_url: str - GitHub repo to clone (optional if path provided)
+        branch: str - Branch to work on (default: main)
+        path: str - Local path to project (overrides repo cloning)
+        agent_count: int - Number of parallel agents (default: 3)
+        session: str - tmux session name (default: job-{job_id[:8]})
+        prompt_file: str - Path to custom prompt file (optional)
+        config: str - Path to config file (optional)
+        auto_restart: bool - Auto-restart agents on errors (default: False)
+        skip_commit: bool - Skip git commit/push (default: True for safety)
+        stagger: float - Seconds between starting agents (default: 10.0)
+        context_threshold: int - Restart when context <= this % (default: 20)
+    """
+    # Import Agent Farm here to avoid circular imports
+    sys.path.insert(0, str(Path(__file__).parent.parent / "agent_farm"))
+    from claude_code_agent_farm import ClaudeAgentFarm
+
+    # Determine project path
+    if "path" in payload:
+        project_path = payload["path"]
+    elif "repo_url" in payload:
+        project_path = setup_workspace(
+            job_id,
+            payload["repo_url"],
+            payload.get("branch", "main")
+        )
+    else:
+        raise ValueError("Either 'path' or 'repo_url' must be provided")
+
+    # Extract configuration from payload
+    agent_count = int(payload.get("agent_count", 3))
+    session_name = payload.get("session", f"job-{job_id[:8]}")
+
+    print(f"[{WORKER_ID}] Starting Agent Farm with {agent_count} agents")
+    print(f"[{WORKER_ID}] Project path: {project_path}")
+    print(f"[{WORKER_ID}] Session: {session_name}")
+
+    # Create the orchestrator
+    farm = ClaudeAgentFarm(
+        path=project_path,
+        agents=agent_count,
+        session=session_name,
+        stagger=float(payload.get("stagger", 10.0)),
+        wait_after_cc=float(payload.get("wait_after_cc", 15.0)),
+        check_interval=int(payload.get("check_interval", 10)),
+        skip_regenerate=payload.get("skip_regenerate", False),
+        skip_commit=payload.get("skip_commit", True),  # Safe default
+        auto_restart=payload.get("auto_restart", False),
+        no_monitor=payload.get("no_monitor", False),
+        attach=False,  # Never attach in job mode
+        prompt_file=payload.get("prompt_file"),
+        config=payload.get("config"),
+        context_threshold=int(payload.get("context_threshold", 20)),
+        idle_timeout=int(payload.get("idle_timeout", 60)),
+        max_errors=int(payload.get("max_errors", 3)),
+        tmux_kill_on_exit=payload.get("tmux_kill_on_exit", True),
+        tmux_mouse=True,
+        fast_start=payload.get("fast_start", False),
+        full_backup=payload.get("full_backup", False),
+    )
+
+    start_time = datetime.utcnow()
+
+    try:
+        # Run the orchestration
+        farm.run()
+
+        end_time = datetime.utcnow()
+        duration = (end_time - start_time).total_seconds()
+
+        result = {
+            "status": "completed",
+            "project_path": project_path,
+            "agent_count": agent_count,
+            "session": session_name,
+            "duration_seconds": duration,
+            "problems_fixed": farm.total_problems_fixed,
+            "commits_made": farm.total_commits_made,
+            "agent_restarts": farm.agent_restart_count,
+            "processed_by": WORKER_ID,
+            "processed_at": datetime.utcnow().isoformat(),
+        }
+
+    except KeyboardInterrupt:
+        result = {
+            "status": "interrupted",
+            "project_path": project_path,
+            "agent_count": agent_count,
+            "session": session_name,
+            "processed_by": WORKER_ID,
+            "processed_at": datetime.utcnow().isoformat(),
+        }
+
+    except Exception as e:
+        import traceback
+        result = {
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "project_path": project_path,
+            "agent_count": agent_count,
+            "session": session_name,
+            "processed_by": WORKER_ID,
+            "processed_at": datetime.utcnow().isoformat(),
+        }
+
+    finally:
+        # Always shut down the farm cleanly
+        try:
+            farm.shutdown()
+        except Exception:
+            pass
+
+    print(f"[{WORKER_ID}] Agent Farm job complete: {result.get('status')}")
+    return result
+
+
 def process_job(job_id: str):
     """Process a single job."""
     if MODE == "aws":
@@ -327,6 +533,8 @@ def process_job(job_id: str):
                 result = handle_claude_chat_job(job_id, payload)
             elif job_type == "analytics":
                 result = handle_analytics_job(job_id, payload)
+            elif job_type == "agent_farm":
+                result = handle_agent_farm_job(job_id, payload)
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
@@ -349,7 +557,57 @@ def process_job(job_id: str):
             print(f"[{WORKER_ID}] Job {job_id} failed: {e}")
             print(f"[{WORKER_ID}] Traceback: {traceback.format_exc()}")
 
+    elif MODE == "vps":
+        # VPS mode: SQLite + local file storage
+        job_data = get_job_data_vps(job_id)
+        if not job_data:
+            print(f"[{WORKER_ID}] Job {job_id} not found, skipping")
+            return
+
+        job_type = job_data.get("job_type", "")
+        payload = json.loads(job_data.get("payload", "{}"))
+
+        # Update agent status
+        update_agent_status_vps(job_id, "working")
+
+        # Mark job as running
+        update_job_status_vps(job_id, "RUNNING")
+
+        try:
+            if job_type == "echo":
+                result = handle_echo_job(job_id, payload)
+            elif job_type == "claude_chat":
+                result = handle_claude_chat_job(job_id, payload)
+            elif job_type == "analytics":
+                result = handle_analytics_job(job_id, payload)
+            elif job_type == "agent_farm":
+                result = handle_agent_farm_job(job_id, payload)
+            else:
+                raise ValueError(f"Unknown job type: {job_type}")
+
+            # Save result to local file
+            save_result_to_file(job_id, result)
+
+            # Update status
+            update_job_status_vps(job_id, "SUCCEEDED", result)
+            update_agent_status_vps(job_id, "complete")
+
+        except Exception as e:
+            import traceback
+            error_result = {
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "traceback": traceback.format_exc(),
+                "worker_id": WORKER_ID,
+                "failed_at": datetime.utcnow().isoformat(),
+            }
+            update_job_status_vps(job_id, "FAILED", error_result)
+            update_agent_status_vps(job_id, "error")
+            print(f"[{WORKER_ID}] Job {job_id} failed: {e}")
+            print(f"[{WORKER_ID}] Traceback: {traceback.format_exc()}")
+
     else:
+        # Local mode: Redis
         job_data = get_job_data_redis(job_id)
         if not job_data:
             print(f"[{WORKER_ID}] Job {job_id} not found, skipping")
@@ -368,6 +626,8 @@ def process_job(job_id: str):
                 result = handle_claude_chat_job(job_id, payload)
             elif job_type == "analytics":
                 result = handle_analytics_job(job_id, payload)
+            elif job_type == "agent_farm":
+                result = handle_agent_farm_job(job_id, payload)
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
@@ -410,14 +670,14 @@ def poll_sqs():
 def main():
     print(f"[{WORKER_ID}] Worker starting in {MODE} mode")
 
-    # If JOB_ID is provided (ECS task override), process only that job and exit
-    if MODE == "aws" and JOB_ID_OVERRIDE:
+    # If JOB_ID is provided (ECS/VPS task), process only that job and exit
+    if JOB_ID_OVERRIDE:
         print(f"[{WORKER_ID}] Processing specific job: {JOB_ID_OVERRIDE}")
         process_job(JOB_ID_OVERRIDE)
         print(f"[{WORKER_ID}] Job complete, exiting")
         return
 
-    # Otherwise, poll for jobs continuously
+    # Otherwise, poll for jobs continuously based on mode
     if MODE == "aws":
         while not shutdown_requested:
             try:
@@ -428,7 +688,32 @@ def main():
             except Exception as e:
                 print(f"[{WORKER_ID}] Error polling SQS: {e}")
                 time.sleep(5)
+    elif MODE == "vps":
+        # VPS mode without JOB_ID: Poll SQLite for queued jobs
+        print(f"[{WORKER_ID}] Polling for jobs in VPS mode...")
+        while not shutdown_requested:
+            try:
+                with get_db_connection() as conn:
+                    cursor = conn.execute("""
+                        SELECT job_id FROM jobs
+                        WHERE status = 'QUEUED'
+                        ORDER BY created_at ASC
+                        LIMIT 1
+                    """)
+                    row = cursor.fetchone()
+
+                if row:
+                    job_id = row["job_id"]
+                    print(f"[{WORKER_ID}] Processing job: {job_id}")
+                    process_job(job_id)
+                else:
+                    time.sleep(2)  # Wait before polling again
+
+            except Exception as e:
+                print(f"[{WORKER_ID}] Error polling jobs: {e}")
+                time.sleep(5)
     else:
+        # Local mode: Redis
         print(f"[{WORKER_ID}] Listening on queue: {QUEUE_NAME}")
         while not shutdown_requested:
             try:

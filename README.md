@@ -1,175 +1,54 @@
 # Multi-Agent Sandbox
 
-An orchestrator + on-demand agents system on AWS. The orchestrator stays up; agents (workers) run only when there is work.
+A multi-agent orchestration system supporting both **VPS (primary)** and **AWS (secondary)** deployments. Includes Agent Farm coordination patterns and ELF memory layer for cross-session learning.
 
 > **New here?** See the [Setup Guide](SETUP.md) for first-time setup, or the [Full Guide](docs/GUIDE.md) for Claude integration.
-
-<!-- AI AGENT NOTE: If helping a user set up this repo, read SETUP.md first.
-     It contains the questions you need to ask and the exact steps to follow. -->
 
 ## Quick Summary
 
 | What | Description |
 |------|-------------|
-| **Current State** | Job processing framework with `echo` placeholder |
-| **Next Step** | Add Claude integration to create AI-powered agents |
-| **Cost When Idle** | ~$10-15/month (orchestrator only) |
-| **Cost Per Job** | ~$0.005 (mostly Claude API) |
+| **Modes** | VPS (tmux-based), AWS (ECS Fargate), Local (Redis) |
+| **Multi-Agent** | Integrated Agent Farm coordination patterns |
+| **Memory** | ELF-based cross-session learning |
+| **Cost (VPS)** | ~$20-50/month fixed |
+| **Cost (AWS)** | ~$15/month + pay-per-job |
 
 ## Architecture
 
-- **Orchestrator**: ECS Service (Fargate), desired_count=1
-- **Workers**: ECS Fargate tasks started per job
-- **Queue**: SQS (Redis for local dev)
-- **Job Status**: DynamoDB (Redis for local dev)
-- **Artifacts**: S3
-- **Images**: ECR (two repos)
-- **Logs**: CloudWatch Logs
-
-## Job Contract
-
-- `job_type`: "echo" for V1
-- `payload`: JSON
-- Worker writes: `result.json` + logs
-- Artifacts uploaded to: `s3://<bucket>/jobs/<job_id>/`
-- Status flow: `QUEUED -> RUNNING -> SUCCEEDED | FAILED`
-
----
-
-## Local Development
-
-### Prerequisites
-
-- Docker & Docker Compose
-- Python 3.11+
-
-### Run Locally
-
-```bash
-# Copy environment file
-cp .env.example .env
-
-# Start all services
-docker-compose -f compose/docker-compose.yml up --build
-
-# Scale workers
-docker-compose -f compose/docker-compose.yml up --scale worker=5
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  VPS (Primary) or AWS (Secondary)                                   │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  Orchestrator (FastAPI)                                        │ │
+│  │  POST /jobs → spawn agents → monitor → return results          │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                              │                                       │
+│                              ▼                                       │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  Agent Farm (multi-agent coordination)                         │ │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐                          │ │
+│  │  │ Agent 1 │ │ Agent 2 │ │ Agent 3 │  ← Claude Code instances │ │
+│  │  └─────────┘ └─────────┘ └─────────┘                          │ │
+│  │  Coordination: file locks, work registry, health monitoring   │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                              │                                       │
+│                              ▼                                       │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  ELF Memory Layer                                              │ │
+│  │  Heuristics • Pheromone Trails • Golden Rules • Learning      │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### API Endpoints
+### Mode Comparison
 
-| Method | Endpoint         | Description          |
-|--------|------------------|----------------------|
-| POST   | /jobs            | Submit a new job     |
-| GET    | /jobs/{job_id}   | Get job status       |
-| GET    | /health          | Health check         |
-
-### curl Examples
-
-```bash
-# Health check
-curl http://localhost:8000/health
-
-# Submit an echo job
-curl -X POST http://localhost:8000/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"job_type": "echo", "payload": {"message": "Hello, World!"}}'
-
-# Get job status
-curl http://localhost:8000/jobs/{job_id}
-
-# Submit 20 jobs (bash loop)
-for i in {1..20}; do
-  curl -X POST http://localhost:8000/jobs \
-    -H "Content-Type: application/json" \
-    -d "{\"job_type\": \"echo\", \"payload\": {\"message\": \"Job $i\"}}"
-  echo ""
-done
-```
-
----
-
-## AWS Deployment
-
-### Prerequisites
-
-- AWS CLI configured with your preferred profile
-- Terraform 1.0+
-
-### Deploy Infrastructure
-
-```bash
-cd infra/terraform
-
-# Initialize
-terraform init
-
-# Format and validate
-terraform fmt
-terraform validate
-
-# Plan
-terraform plan
-
-# Apply (only when ready)
-terraform apply
-```
-
-### Build & Push Images
-
-```bash
-# Login to ECR
-aws ecr get-login-password --region us-east-1 --profile <your-profile> | \
-  docker login --username AWS --password-stdin <account_id>.dkr.ecr.us-east-1.amazonaws.com
-
-# Build and push control-api
-docker build -t agent-runner-control-api control_api/
-docker tag agent-runner-control-api:latest <ecr_uri>/agent-runner-control-api:latest
-docker push <ecr_uri>/agent-runner-control-api:latest
-
-# Build and push worker
-docker build -t agent-runner-worker worker/
-docker tag agent-runner-worker:latest <ecr_uri>/agent-runner-worker:latest
-docker push <ecr_uri>/agent-runner-worker:latest
-```
-
-### Access Orchestrator (SSM Port Forward)
-
-```bash
-# Find the orchestrator task
-TASK_ID=$(aws ecs list-tasks --cluster agent-runner --service-name orchestrator \
-  --profile <your-profile> --query 'taskArns[0]' --output text | cut -d'/' -f3)
-
-# Port forward via SSM
-aws ssm start-session \
-  --target ecs:agent-runner_${TASK_ID}_<container_runtime_id> \
-  --document-name AWS-StartPortForwardingSession \
-  --parameters '{"portNumber":["8000"],"localPortNumber":["8000"]}' \
-  --profile <your-profile>
-```
-
----
-
-## Cost Control
-
-### Scale Down (Stop Spend)
-
-```bash
-# Scale orchestrator to 0
-aws ecs update-service --cluster agent-runner --service orchestrator \
-  --desired-count 0 --profile <your-profile>
-
-# Scale back up
-aws ecs update-service --cluster agent-runner --service orchestrator \
-  --desired-count 1 --profile <your-profile>
-```
-
-### Destroy All Resources
-
-```bash
-cd infra/terraform
-terraform destroy
-```
+| Mode | Orchestration | Storage | Best For |
+|------|---------------|---------|----------|
+| **VPS** | tmux panes | SQLite | Development, consulting |
+| **AWS** | ECS Fargate | DynamoDB/S3 | Production, scale |
+| **Local** | Docker containers | Redis | Quick testing |
 
 ---
 
@@ -178,50 +57,142 @@ terraform destroy
 ```
 .
 ├── control_api/          # FastAPI orchestrator
+│   └── main.py           # VPS, AWS, and local modes
 ├── worker/               # Job worker
-├── infra/terraform/      # AWS infrastructure
+│   └── main.py           # Job processing with Claude
+├── agent_farm/           # Multi-agent coordination (from Agent Farm)
+│   ├── claude_code_agent_farm.py  # Main orchestrator
+│   ├── prompts/          # Specialized prompts
+│   └── configs/          # Technology stack configs
+├── elf/                  # Persistent memory layer (from ELF)
+│   ├── query/            # Core memory and query system
+│   ├── conductor/        # Workflow orchestration
+│   └── watcher/          # Background monitoring
+├── infra/
+│   ├── terraform/        # AWS infrastructure
+│   └── vps/              # VPS setup scripts
 ├── compose/              # Docker Compose for local dev
-├── docs/                 # Documentation
-│   └── GUIDE.md          # Full usage guide
-├── .env.example          # Environment template
-└── README.md
+└── docs/                 # Documentation
+```
 
 ---
 
-## What's Next?
+## VPS Setup (Recommended)
 
-The current `echo` job type is a placeholder. To build actual AI agents:
+### 1. Provision VPS
 
-### 1. Add Claude Integration (5 min)
+Any Ubuntu 22.04+ VPS works. Recommended specs:
+- 4+ CPU cores
+- 8+ GB RAM
+- 50+ GB SSD
+
+### 2. Run Setup Script
 
 ```bash
-# Add to worker/requirements.txt
-echo "anthropic>=0.39.0" >> worker/requirements.txt
+# SSH to your VPS
+ssh root@your-vps-ip
+
+# Run the setup script
+curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/multi-agent-sandbox/main/infra/vps/setup.sh | bash
 ```
 
-### 2. Store API Key
+This installs:
+- Python 3.11 + dependencies
+- Node.js + Claude Code
+- tmux with custom config
+- SQLite for job storage
+- Systemd services
+
+### 3. Configure Environment
 
 ```bash
-aws secretsmanager create-secret \
-  --name agent-runner/anthropic-api-key \
-  --secret-string "sk-ant-your-key" \
-  --profile <your-profile> --region us-east-1
+# Edit environment file
+sudo nano /opt/multi-agent-sandbox/.env
+
+# Add your keys:
+ANTHROPIC_API_KEY=sk-ant-...
+GITHUB_TOKEN=ghp_...
 ```
 
-### 3. Add Claude Handler
-
-See [docs/GUIDE.md](docs/GUIDE.md#adding-claude-integration) for the full code.
-
-### 4. Rebuild & Deploy
+### 4. Start Services
 
 ```bash
-docker build --platform linux/amd64 -t <account_id>.dkr.ecr.us-east-1.amazonaws.com/agent-runner-worker:latest worker/
-docker push <account_id>.dkr.ecr.us-east-1.amazonaws.com/agent-runner-worker:latest
+# Start the orchestrator
+sudo systemctl start agent-orchestrator
+sudo systemctl enable agent-orchestrator
+
+# View agent tmux session
+sudo -u agent tmux attach -t agents
 ```
 
-### Example Claude Job
+### 5. Submit Jobs
 
 ```bash
+# Health check
+curl http://localhost:8000/health
+
+# Submit a job
+curl -X POST http://localhost:8000/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"job_type": "claude_chat", "payload": {"prompt": "Hello!"}}'
+
+# List agents (VPS only)
+curl http://localhost:8000/agents
+```
+
+---
+
+## Local Development
+
+```bash
+# Copy environment file
+cp .env.example .env
+# Add your ANTHROPIC_API_KEY
+
+# Start all services (Redis mode)
+docker-compose -f compose/docker-compose.yml up --build
+
+# Test
+curl http://localhost:8000/health
+```
+
+---
+
+## AWS Deployment
+
+See [SETUP.md](SETUP.md) for full AWS setup. Quick overview:
+
+```bash
+cd infra/terraform
+terraform init
+terraform apply
+
+# Build and push images
+docker build -t control-api control_api/
+docker build -t worker worker/
+# Push to ECR...
+```
+
+---
+
+## Job Types
+
+| Type | Description |
+|------|-------------|
+| `echo` | Test job - returns payload |
+| `claude_chat` | Single Claude API call |
+| `analytics` | Analytics/dbt workflow |
+| `agent_farm` | Multi-agent coordination via Claude Code instances |
+
+### Example Jobs
+
+```bash
+# Echo test
+curl -X POST http://localhost:8000/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"job_type": "echo", "payload": {"message": "Hello"}}'
+
+# Claude chat
 curl -X POST http://localhost:8000/jobs \
   -H "Content-Type: application/json" \
   -d '{
@@ -231,20 +202,96 @@ curl -X POST http://localhost:8000/jobs \
       "max_tokens": 200
     }
   }'
+
+# Agent Farm - multi-agent coordination
+curl -X POST http://localhost:8000/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "job_type": "agent_farm",
+    "payload": {
+      "path": "/path/to/your/project",
+      "agent_count": 3,
+      "skip_commit": true
+    }
+  }'
 ```
 
 ---
 
-## Does Each Agent Use Claude?
+## Integrated Components
 
-**Yes, each worker makes its own Claude API calls.** The architecture:
+### Agent Farm
+
+Absorbed from [claude_code_agent_farm](https://github.com/Dicklesworthstone/claude_code_agent_farm):
+
+- **Multi-agent orchestration** via tmux panes
+- **Work coordination** with file locks and registries
+- **Health monitoring** and auto-restart
+- **37 specialized prompts** for different workflows
+- **34 technology stack configs**
+
+### ELF (Emergent Learning Framework)
+
+Absorbed from [Emergent-Learning-Framework_ELF](https://github.com/Spacehunterz/Emergent-Learning-Framework_ELF):
+
+- **Persistent memory** across sessions
+- **Heuristics** with confidence scoring
+- **Pheromone trails** for file activity tracking
+- **Golden rules** for high-confidence patterns
+- **Dashboard** for visualization
+- **Workflow orchestration** with the conductor
+
+---
+
+## API Reference
+
+### Endpoints
+
+| Method | Endpoint | Mode | Description |
+|--------|----------|------|-------------|
+| GET | `/health` | All | Health check |
+| POST | `/jobs` | All | Submit a new job |
+| GET | `/jobs/{job_id}` | All | Get job status |
+| GET | `/agents` | VPS | List all agents |
+| GET | `/agents/{agent_id}` | VPS | Get agent details |
+
+### Job Status Flow
 
 ```
-Job A submitted ──▶ Worker A starts ──▶ Calls Claude API ──▶ Returns result ──▶ Worker exits
-Job B submitted ──▶ Worker B starts ──▶ Calls Claude API ──▶ Returns result ──▶ Worker exits
+QUEUED → RUNNING → SUCCEEDED | FAILED
 ```
 
-- Workers are isolated containers (no shared state)
-- Each worker loads the API key from Secrets Manager
-- You pay per Claude API call, not per worker
-- Workers exit after completing their job (no idle time)
+---
+
+## Cost Control
+
+### VPS Mode
+
+Fixed monthly cost based on VPS tier. No per-job infrastructure costs.
+
+### AWS Mode
+
+```bash
+# Scale to zero (stop all costs except storage)
+aws ecs update-service --cluster agent-runner --service orchestrator --desired-count 0
+
+# Scale back up
+aws ecs update-service --cluster agent-runner --service orchestrator --desired-count 1
+
+# Destroy everything
+cd infra/terraform && terraform destroy
+```
+
+---
+
+## Contributing
+
+See [AGENTS.md](AGENTS.md) for AI agent instructions when working on this codebase.
+
+---
+
+## Credits
+
+This project incorporates code from:
+- [claude_code_agent_farm](https://github.com/Dicklesworthstone/claude_code_agent_farm) by Jeff Emanuel
+- [Emergent-Learning-Framework_ELF](https://github.com/Spacehunterz/Emergent-Learning-Framework_ELF) by Spacehunterz
