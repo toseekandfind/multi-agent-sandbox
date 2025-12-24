@@ -34,6 +34,9 @@ services:
       dockerfile: Dockerfile
     environment:
       - REDIS_URL=redis://redis:6379
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    volumes:
+      - ${WORKSPACE_PATH:-~/repos}:/workspace
     depends_on:
       redis:
         condition: service_healthy

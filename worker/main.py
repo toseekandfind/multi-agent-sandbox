@@ -166,6 +166,137 @@ def handle_claude_chat_job(job_id: str, payload: dict) -> dict:
     return result
 
 
+def handle_analytics_job(job_id: str, payload: dict) -> dict:
+    """
+    Analytics job handler - reads files, calls Claude, writes output.
+
+    Payload:
+        task: str - Description of the analytics task
+        repo: str - Subdirectory under /workspace (e.g., "client_a_dbt")
+        files_to_read: list[str] (optional) - Files to read as context
+        output_files: dict (optional) - {filename: description} for files to create
+    """
+    import os
+    from pathlib import Path
+
+    client = get_anthropic_client()
+
+    task = payload.get("task", "")
+    repo = payload.get("repo", "")
+    files_to_read = payload.get("files_to_read", [])
+
+    workspace = Path("/workspace") / repo
+    output_dir = workspace / "_agent_output" / job_id
+
+    print(f"[{WORKER_ID}] Analytics job: {task[:100]}...")
+    print(f"[{WORKER_ID}] Working in: {workspace}")
+
+    # Read requested files
+    file_contents = {}
+    for file_path in files_to_read:
+        full_path = workspace / file_path
+        if full_path.exists():
+            try:
+                file_contents[file_path] = full_path.read_text()
+                print(f"[{WORKER_ID}] Read: {file_path}")
+            except Exception as e:
+                file_contents[file_path] = f"[Error reading file: {e}]"
+        else:
+            file_contents[file_path] = f"[File not found: {file_path}]"
+
+    # Build context for Claude
+    context_parts = []
+    if file_contents:
+        context_parts.append("## Files provided as context:\n")
+        for path, content in file_contents.items():
+            context_parts.append(f"### {path}\n```\n{content}\n```\n")
+
+    # List available files for reference
+    if workspace.exists():
+        available_files = []
+        for p in workspace.rglob("*"):
+            if p.is_file() and not any(part.startswith(".") for part in p.parts):
+                rel_path = p.relative_to(workspace)
+                if len(available_files) < 50:  # Limit to 50 files
+                    available_files.append(str(rel_path))
+        if available_files:
+            context_parts.append(f"\n## Available files in repo:\n{chr(10).join(available_files[:50])}")
+            if len(available_files) == 50:
+                context_parts.append("\n(truncated, more files exist)")
+
+    context = "\n".join(context_parts)
+
+    system_prompt = """You are an expert Analytics Engineer. You help create dbt models, SQL transformations, and data tests.
+
+When creating files, format your response with clear file markers like this:
+--- FILE: path/to/file.sql ---
+<file contents>
+--- END FILE ---
+
+Always explain your reasoning before showing the files.
+After showing files, add an analysis section explaining what you built and how to verify it works."""
+
+    user_message = f"""Task: {task}
+
+{context}
+
+Please complete this task. If creating new files, use the FILE markers shown in the system prompt."""
+
+    print(f"[{WORKER_ID}] Calling Claude for analytics task...")
+
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_message}],
+    )
+
+    response_text = message.content[0].text
+    print(f"[{WORKER_ID}] Claude responded with {message.usage.output_tokens} tokens")
+
+    # Parse and write output files
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written_files = []
+
+    # Extract files from response using markers
+    import re
+    file_pattern = r"--- FILE: (.+?) ---\n(.*?)--- END FILE ---"
+    matches = re.findall(file_pattern, response_text, re.DOTALL)
+
+    for file_path, content in matches:
+        file_path = file_path.strip()
+        content = content.strip()
+
+        # Write to output directory
+        out_path = output_dir / file_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(content)
+        written_files.append(str(file_path))
+        print(f"[{WORKER_ID}] Wrote: {out_path}")
+
+    # Write full response as analysis.md
+    analysis_path = output_dir / "analysis.md"
+    analysis_path.write_text(f"# Analytics Task: {task}\n\n{response_text}")
+    written_files.append("analysis.md")
+
+    result = {
+        "task": task,
+        "repo": repo,
+        "files_read": list(file_contents.keys()),
+        "files_written": written_files,
+        "output_dir": str(output_dir),
+        "response_preview": response_text[:500] + "..." if len(response_text) > 500 else response_text,
+        "usage": {
+            "input_tokens": message.usage.input_tokens,
+            "output_tokens": message.usage.output_tokens,
+        },
+        "processed_by": WORKER_ID,
+        "processed_at": datetime.utcnow().isoformat(),
+    }
+
+    return result
+
+
 def get_job_data_aws(job_id: str) -> dict:
     response = table.get_item(Key={"job_id": job_id})
     return response.get("Item", {})
@@ -194,6 +325,8 @@ def process_job(job_id: str):
                 result = handle_echo_job(job_id, payload)
             elif job_type == "claude_chat":
                 result = handle_claude_chat_job(job_id, payload)
+            elif job_type == "analytics":
+                result = handle_analytics_job(job_id, payload)
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
@@ -233,6 +366,8 @@ def process_job(job_id: str):
                 result = handle_echo_job(job_id, payload)
             elif job_type == "claude_chat":
                 result = handle_claude_chat_job(job_id, payload)
+            elif job_type == "analytics":
+                result = handle_analytics_job(job_id, payload)
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
