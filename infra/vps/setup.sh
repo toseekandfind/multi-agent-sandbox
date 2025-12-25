@@ -137,26 +137,32 @@ chown -R "${AGENT_USER}:${AGENT_USER}" "/home/${AGENT_USER}/.claude"
 log_success "Workspace created at ${WORKSPACE_DIR}"
 
 # ============================================
-# Phase 6: Clone Multi-Agent Sandbox
+# Phase 6: Setup Multi-Agent Sandbox
 # ============================================
-log_info "Phase 6: Cloning multi-agent-sandbox..."
+log_info "Phase 6: Setting up multi-agent-sandbox..."
 
 REPO_DIR="/opt/multi-agent-sandbox"
-if [[ -d "${REPO_DIR}" ]]; then
-    cd "${REPO_DIR}"
-    git pull origin main
-else
-    git clone https://github.com/YOUR_USERNAME/multi-agent-sandbox.git "${REPO_DIR}"
-fi
 
-cd "${REPO_DIR}"
+# Check if already in repo directory (user cloned first)
+if [[ -f "./control_api/main.py" ]]; then
+    REPO_DIR="$(pwd)"
+    log_info "Using current directory as repo: ${REPO_DIR}"
+elif [[ -d "${REPO_DIR}" ]]; then
+    log_info "Using existing repo at ${REPO_DIR}"
+    cd "${REPO_DIR}"
+else
+    log_error "Repo not found. Please clone first:"
+    log_error "  git clone <your-repo-url> ${REPO_DIR}"
+    log_error "  cd ${REPO_DIR} && bash infra/vps/setup.sh"
+    exit 1
+fi
 
 # Install Python dependencies
 python3 -m pip install --upgrade pip
 python3 -m pip install -r worker/requirements.txt
 python3 -m pip install -r control_api/requirements.txt
 
-log_success "Multi-agent-sandbox installed"
+log_success "Multi-agent-sandbox installed at ${REPO_DIR}"
 
 # ============================================
 # Phase 7: Configure tmux
@@ -281,7 +287,7 @@ TMUX_SESSION=agents
 API_HOST=0.0.0.0
 API_PORT=8000
 
-# Anthropic API Key (required)
+# Anthropic API Key (only needed for claude_chat/analytics jobs, NOT for agent_farm)
 # ANTHROPIC_API_KEY=sk-ant-...
 
 # GitHub Token (for private repos)
@@ -319,22 +325,24 @@ echo "=========================================="
 echo ""
 echo "Next steps:"
 echo ""
-echo "1. Edit the environment file:"
-echo "   sudo nano ${REPO_DIR}/.env"
-echo "   - Add your ANTHROPIC_API_KEY"
-echo "   - Add your GITHUB_TOKEN (if using private repos)"
+echo "1. Authenticate Claude Code (required for agent_farm jobs):"
+echo "   sudo -u ${AGENT_USER} claude login"
 echo ""
-echo "2. Start the orchestrator:"
+echo "2. (Optional) Add API key for claude_chat/analytics jobs:"
+echo "   echo 'ANTHROPIC_API_KEY=sk-ant-...' >> ${REPO_DIR}/.env"
+echo ""
+echo "3. Start the orchestrator:"
 echo "   sudo systemctl start agent-orchestrator"
 echo "   sudo systemctl enable agent-orchestrator"
 echo ""
-echo "3. Access the API:"
+echo "4. Access the API and dashboard:"
 echo "   curl http://localhost:8000/health"
+echo "   open http://YOUR_VPS_IP:8000/dashboard"
 echo ""
-echo "4. View agent tmux session:"
+echo "5. View agent tmux session:"
 echo "   sudo -u ${AGENT_USER} tmux attach -t agents"
 echo ""
-echo "5. Submit a test job:"
+echo "6. Submit a test job:"
 echo "   curl -X POST http://localhost:8000/jobs \\"
 echo "     -H 'Content-Type: application/json' \\"
 echo "     -d '{\"job_type\": \"echo\", \"payload\": {\"message\": \"Hello\"}}'"

@@ -4,13 +4,112 @@ import uuid
 import subprocess
 import sqlite3
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Security
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
 app = FastAPI(title="Agent Runner Control API")
+
+# ============================================================================
+# Multi-Tenant Authentication
+# ============================================================================
+
+# API Key configuration
+# Keys can be set via:
+# 1. Environment variable: API_KEYS='{"key1": "client-a", "key2": "client-b"}'
+# 2. Config file: /etc/agent-sandbox/clients.json
+# 3. Default: No auth required (for local development)
+
+API_KEYS_ENV = os.getenv("API_KEYS", "")
+API_KEYS_FILE = os.getenv("API_KEYS_FILE", "/etc/agent-sandbox/clients.json")
+AUTH_ENABLED = os.getenv("AUTH_ENABLED", "false").lower() == "true"
+
+_api_keys: Dict[str, str] = {}  # api_key -> client_id mapping
+
+
+def load_api_keys() -> Dict[str, str]:
+    """Load API keys from environment or config file."""
+    global _api_keys
+
+    if _api_keys:
+        return _api_keys
+
+    # Try environment variable first
+    if API_KEYS_ENV:
+        try:
+            _api_keys = json.loads(API_KEYS_ENV)
+            print(f"Loaded {len(_api_keys)} API keys from environment")
+            return _api_keys
+        except json.JSONDecodeError:
+            print("Warning: Invalid JSON in API_KEYS environment variable")
+
+    # Try config file
+    if Path(API_KEYS_FILE).exists():
+        try:
+            with open(API_KEYS_FILE) as f:
+                _api_keys = json.load(f)
+            print(f"Loaded {len(_api_keys)} API keys from {API_KEYS_FILE}")
+            return _api_keys
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Could not load API keys from {API_KEYS_FILE}: {e}")
+
+    return _api_keys
+
+
+# API Key header
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def get_client_id(api_key: Optional[str] = Security(api_key_header)) -> Optional[str]:
+    """
+    Validate API key and return client_id.
+
+    If AUTH_ENABLED is false, returns "default" client.
+    If AUTH_ENABLED is true, requires valid API key.
+    """
+    if not AUTH_ENABLED:
+        # Auth disabled - use default client or extract from header if provided
+        if api_key:
+            keys = load_api_keys()
+            return keys.get(api_key, "default")
+        return "default"
+
+    # Auth enabled - require valid API key
+    if not api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing API key. Provide X-API-Key header."
+        )
+
+    keys = load_api_keys()
+    client_id = keys.get(api_key)
+
+    if not client_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid API key"
+        )
+
+    return client_id
+
+
+def get_client_workspace(client_id: str) -> Path:
+    """Get the workspace directory for a client."""
+    base = Path(os.getenv("WORKSPACE_DIR", "/workspace"))
+    client_workspace = base / client_id
+    client_workspace.mkdir(parents=True, exist_ok=True)
+    return client_workspace
+
+
+def get_client_elf_db(client_id: str) -> str:
+    """Get the ELF database path for a client."""
+    base = Path.home() / ".claude" / "elf"
+    client_db_dir = base / client_id
+    client_db_dir.mkdir(parents=True, exist_ok=True)
+    return str(client_db_dir / "memory.db")
 
 # Mode: "local" (Redis), "aws" (SQS + DynamoDB + ECS), or "vps" (SQLite + tmux)
 MODE = os.getenv("MODE", "local")
@@ -53,6 +152,7 @@ elif MODE == "vps":
         conn.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
                 job_id TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL DEFAULT 'default',
                 job_type TEXT NOT NULL,
                 status TEXT NOT NULL,
                 payload TEXT NOT NULL,
@@ -61,10 +161,17 @@ elif MODE == "vps":
                 updated_at TEXT NOT NULL
             )
         """)
+        # Add client_id column if it doesn't exist (migration for existing DBs)
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default'")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS agents (
                 agent_id TEXT PRIMARY KEY,
                 job_id TEXT NOT NULL,
+                client_id TEXT NOT NULL DEFAULT 'default',
                 tmux_pane TEXT,
                 status TEXT NOT NULL,
                 started_at TEXT NOT NULL,
@@ -72,6 +179,15 @@ elif MODE == "vps":
                 FOREIGN KEY (job_id) REFERENCES jobs (job_id)
             )
         """)
+        # Add client_id column if it doesn't exist (migration for existing DBs)
+        try:
+            conn.execute("ALTER TABLE agents ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default'")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Create index for client_id queries
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_client ON jobs(client_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_client ON agents(client_id)")
         conn.commit()
 else:
     # Local mode uses Redis
@@ -82,13 +198,23 @@ else:
     JOB_PREFIX = "job:"
 
 
-def spawn_vps_worker(job_id: str, job_type: str, payload: dict) -> str:
+def spawn_vps_worker(job_id: str, job_type: str, payload: dict, client_id: str = "default") -> str:
     """Spawn a worker in a tmux pane on the VPS."""
-    # Generate a unique window name
-    window_name = f"job-{job_id[:8]}"
+    # Generate a unique window name (include client prefix for visibility)
+    window_name = f"{client_id[:8]}-{job_id[:8]}"
+
+    # Get client-scoped workspace and ELF database
+    client_workspace = get_client_workspace(client_id)
+    client_elf_db = get_client_elf_db(client_id)
 
     # Environment variables to pass to the worker
-    env_vars = f"MODE=vps JOB_ID={job_id} WORKSPACE_DIR={WORKSPACE_DIR}"
+    env_vars = (
+        f"MODE=vps "
+        f"JOB_ID={job_id} "
+        f"CLIENT_ID={client_id} "
+        f"WORKSPACE_DIR={client_workspace} "
+        f"ELF_DB_PATH={client_elf_db}"
+    )
 
     # Command to run the worker
     worker_cmd = f"{env_vars} python3 {WORKER_SCRIPT_PATH}"
@@ -120,9 +246,9 @@ def spawn_vps_worker(job_id: str, job_type: str, payload: dict) -> str:
     # Record agent in database
     with get_db_connection() as conn:
         conn.execute("""
-            INSERT INTO agents (agent_id, job_id, tmux_pane, status, started_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (job_id, job_id, f"{TMUX_SESSION}:{window_name}", "starting", datetime.utcnow().isoformat()))
+            INSERT INTO agents (agent_id, job_id, client_id, tmux_pane, status, started_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (job_id, job_id, client_id, f"{TMUX_SESSION}:{window_name}", "starting", datetime.utcnow().isoformat()))
         conn.commit()
 
     return f"{TMUX_SESSION}:{window_name}"
@@ -135,6 +261,7 @@ class JobRequest(BaseModel):
 
 class JobResponse(BaseModel):
     job_id: str
+    client_id: str
     job_type: str
     status: str
     payload: dict
@@ -172,14 +299,19 @@ def health():
 
 
 @app.post("/jobs", response_model=JobResponse)
-def create_job(request: JobRequest):
+def create_job(request: JobRequest, client_id: str = Depends(get_client_id)):
     job_id = str(uuid.uuid4())
     now = datetime.utcnow().isoformat()
+
+    # Get client-scoped paths
+    client_workspace = get_client_workspace(client_id)
+    client_elf_db = get_client_elf_db(client_id)
 
     if MODE == "aws":
         # Store job in DynamoDB
         item = {
             "job_id": job_id,
+            "client_id": client_id,
             "job_type": request.job_type,
             "status": "QUEUED",
             "payload": request.payload,
@@ -191,7 +323,7 @@ def create_job(request: JobRequest):
         # Send message to SQS
         sqs.send_message(
             QueueUrl=SQS_QUEUE_URL,
-            MessageBody=json.dumps({"job_id": job_id}),
+            MessageBody=json.dumps({"job_id": job_id, "client_id": client_id}),
         )
 
         # Start a worker task in ECS
@@ -213,6 +345,9 @@ def create_job(request: JobRequest):
                             "name": "worker",
                             "environment": [
                                 {"name": "JOB_ID", "value": job_id},
+                                {"name": "CLIENT_ID", "value": client_id},
+                                {"name": "WORKSPACE_DIR", "value": str(client_workspace)},
+                                {"name": "ELF_DB_PATH", "value": client_elf_db},
                             ],
                         }
                     ]
@@ -225,16 +360,16 @@ def create_job(request: JobRequest):
         # Store job in SQLite
         with get_db_connection() as conn:
             conn.execute("""
-                INSERT INTO jobs (job_id, job_type, status, payload, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (job_id, request.job_type, "QUEUED", json.dumps(request.payload), now, now))
+                INSERT INTO jobs (job_id, client_id, job_type, status, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (job_id, client_id, request.job_type, "QUEUED", json.dumps(request.payload), now, now))
             conn.commit()
 
         # Spawn worker in tmux
         try:
-            pane = spawn_vps_worker(job_id, request.job_type, request.payload)
+            pane = spawn_vps_worker(job_id, request.job_type, request.payload, client_id)
             if pane:
-                print(f"Spawned worker for job {job_id} in {pane}")
+                print(f"Spawned worker for job {job_id} (client: {client_id}) in {pane}")
             else:
                 print(f"Failed to spawn worker for job {job_id}")
         except Exception as e:
@@ -244,6 +379,7 @@ def create_job(request: JobRequest):
         # Store job in Redis (local mode)
         job_data = {
             "job_id": job_id,
+            "client_id": client_id,
             "job_type": request.job_type,
             "status": "QUEUED",
             "payload": json.dumps(request.payload),
@@ -253,12 +389,13 @@ def create_job(request: JobRequest):
         }
         redis_client.hset(f"{JOB_PREFIX}{job_id}", mapping=job_data)
 
-        # Add to queue
-        queue_message = json.dumps({"job_id": job_id})
+        # Add to queue with client_id
+        queue_message = json.dumps({"job_id": job_id, "client_id": client_id})
         redis_client.lpush(QUEUE_NAME, queue_message)
 
     return JobResponse(
         job_id=job_id,
+        client_id=client_id,
         job_type=request.job_type,
         status="QUEUED",
         payload=request.payload,
@@ -268,7 +405,7 @@ def create_job(request: JobRequest):
 
 
 @app.get("/jobs/{job_id}", response_model=JobResponse)
-def get_job(job_id: str):
+def get_job(job_id: str, client_id: str = Depends(get_client_id)):
     if MODE == "aws":
         response = table.get_item(Key={"job_id": job_id})
         item = response.get("Item")
@@ -276,8 +413,13 @@ def get_job(job_id: str):
         if not item:
             raise HTTPException(status_code=404, detail="Job not found")
 
+        # Verify client owns this job (if auth enabled)
+        if AUTH_ENABLED and item.get("client_id") != client_id:
+            raise HTTPException(status_code=403, detail="Access denied to this job")
+
         return JobResponse(
             job_id=item["job_id"],
+            client_id=item.get("client_id", "default"),
             job_type=item["job_type"],
             status=item["status"],
             payload=item["payload"],
@@ -295,12 +437,17 @@ def get_job(job_id: str):
         if not row:
             raise HTTPException(status_code=404, detail="Job not found")
 
+        # Verify client owns this job (if auth enabled)
+        if AUTH_ENABLED and row["client_id"] != client_id:
+            raise HTTPException(status_code=403, detail="Access denied to this job")
+
         result = None
         if row["result"]:
             result = json.loads(row["result"])
 
         return JobResponse(
             job_id=row["job_id"],
+            client_id=row["client_id"],
             job_type=row["job_type"],
             status=row["status"],
             payload=json.loads(row["payload"]),
@@ -314,12 +461,17 @@ def get_job(job_id: str):
         if not job_data:
             raise HTTPException(status_code=404, detail="Job not found")
 
+        # Verify client owns this job (if auth enabled)
+        if AUTH_ENABLED and job_data.get("client_id") != client_id:
+            raise HTTPException(status_code=403, detail="Access denied to this job")
+
         result = None
         if job_data.get("result"):
             result = json.loads(job_data["result"])
 
         return JobResponse(
             job_id=job_data["job_id"],
+            client_id=job_data.get("client_id", "default"),
             job_type=job_data["job_type"],
             status=job_data["status"],
             payload=json.loads(job_data["payload"]),
@@ -329,22 +481,58 @@ def get_job(job_id: str):
         )
 
 
+@app.get("/jobs")
+def list_jobs(client_id: str = Depends(get_client_id), limit: int = 50):
+    """List jobs for the authenticated client."""
+    if MODE == "vps":
+        with get_db_connection() as conn:
+            if AUTH_ENABLED:
+                cursor = conn.execute("""
+                    SELECT * FROM jobs WHERE client_id = ?
+                    ORDER BY created_at DESC LIMIT ?
+                """, (client_id, limit))
+            else:
+                cursor = conn.execute("""
+                    SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?
+                """, (limit,))
+            jobs = []
+            for row in cursor.fetchall():
+                job = dict(row)
+                if job.get("payload"):
+                    job["payload"] = json.loads(job["payload"])
+                if job.get("result"):
+                    job["result"] = json.loads(job["result"])
+                jobs.append(job)
+        return {"jobs": jobs, "count": len(jobs), "client_id": client_id}
+    else:
+        raise HTTPException(status_code=400, detail="Job listing only available in VPS mode currently")
+
+
 @app.get("/agents")
-def list_agents():
-    """List all agents (VPS mode only)."""
+def list_agents(client_id: str = Depends(get_client_id)):
+    """List agents for the authenticated client (VPS mode only)."""
     if MODE != "vps":
         raise HTTPException(status_code=400, detail="Agent listing only available in VPS mode")
 
     with get_db_connection() as conn:
-        cursor = conn.execute("""
-            SELECT a.*, j.job_type, j.status as job_status
-            FROM agents a
-            JOIN jobs j ON a.job_id = j.job_id
-            ORDER BY a.started_at DESC
-        """)
+        if AUTH_ENABLED:
+            cursor = conn.execute("""
+                SELECT a.*, j.job_type, j.status as job_status
+                FROM agents a
+                JOIN jobs j ON a.job_id = j.job_id
+                WHERE a.client_id = ?
+                ORDER BY a.started_at DESC
+            """, (client_id,))
+        else:
+            cursor = conn.execute("""
+                SELECT a.*, j.job_type, j.status as job_status
+                FROM agents a
+                JOIN jobs j ON a.job_id = j.job_id
+                ORDER BY a.started_at DESC
+            """)
         agents = [dict(row) for row in cursor.fetchall()]
 
-    return {"agents": agents, "count": len(agents)}
+    return {"agents": agents, "count": len(agents), "client_id": client_id}
 
 
 @app.get("/agents/{agent_id}")
@@ -366,51 +554,54 @@ def get_agent(agent_id: str):
 
 
 # ============================================================================
-# ELF Dashboard
+# ELF Dashboard (Client-Scoped)
 # ============================================================================
 
-# ELF Memory configuration
-ELF_DB_PATH = os.getenv("ELF_DB_PATH", None)
-_elf_memory = None
+# Cache of ELF memory instances per client
+_elf_memories: Dict[str, any] = {}
 
 
-def get_elf_memory():
-    """Get ELF memory interface (lazy loaded)."""
-    global _elf_memory
-    if _elf_memory is None:
+def get_elf_memory_for_client(client_id: str):
+    """Get ELF memory interface for a specific client."""
+    if client_id not in _elf_memories:
         try:
             import sys
             sys.path.insert(0, str(Path(__file__).parent.parent / "elf"))
             from memory import ELFMemory
-            _elf_memory = ELFMemory(db_path=ELF_DB_PATH)
+            client_db_path = get_client_elf_db(client_id)
+            _elf_memories[client_id] = ELFMemory(db_path=client_db_path)
         except Exception as e:
-            print(f"Warning: Could not initialize ELF memory: {e}")
+            print(f"Warning: Could not initialize ELF memory for client {client_id}: {e}")
             return None
-    return _elf_memory
+    return _elf_memories[client_id]
 
 
 @app.get("/elf/stats")
-def get_elf_stats():
-    """Get ELF memory statistics."""
-    memory = get_elf_memory()
+def get_elf_stats(client_id: str = Depends(get_client_id)):
+    """Get ELF memory statistics for the authenticated client."""
+    memory = get_elf_memory_for_client(client_id)
     if not memory:
         raise HTTPException(status_code=503, detail="ELF memory not available")
 
-    return memory.get_stats()
+    stats = memory.get_stats()
+    stats["client_id"] = client_id
+    return stats
 
 
 @app.get("/elf/heuristics")
 def get_elf_heuristics(
+    client_id: str = Depends(get_client_id),
     domain: Optional[str] = None,
     project_path: Optional[str] = None,
     limit: int = 50
 ):
-    """Get heuristics from ELF memory."""
-    memory = get_elf_memory()
+    """Get heuristics from ELF memory for the authenticated client."""
+    memory = get_elf_memory_for_client(client_id)
     if not memory:
         raise HTTPException(status_code=503, detail="ELF memory not available")
 
     return {
+        "client_id": client_id,
         "heuristics": memory.get_heuristics(
             domain=domain,
             project_path=project_path,
@@ -420,22 +611,22 @@ def get_elf_heuristics(
 
 
 @app.get("/elf/golden-rules")
-def get_elf_golden_rules(project_path: Optional[str] = None):
-    """Get golden rules (high-confidence heuristics)."""
-    memory = get_elf_memory()
+def get_elf_golden_rules(client_id: str = Depends(get_client_id), project_path: Optional[str] = None):
+    """Get golden rules (high-confidence heuristics) for the authenticated client."""
+    memory = get_elf_memory_for_client(client_id)
     if not memory:
         raise HTTPException(status_code=503, detail="ELF memory not available")
 
-    return {"golden_rules": memory.get_golden_rules(project_path=project_path)}
+    return {"client_id": client_id, "golden_rules": memory.get_golden_rules(project_path=project_path)}
 
 
 from fastapi.responses import HTMLResponse
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def get_dashboard():
-    """ELF Dashboard - Visual interface for memory and learning."""
-    memory = get_elf_memory()
+def get_dashboard(client_id: str = Depends(get_client_id)):
+    """ELF Dashboard - Visual interface for memory and learning (client-scoped)."""
+    memory = get_elf_memory_for_client(client_id)
 
     # Get stats
     stats = memory.get_stats() if memory else {}
@@ -561,7 +752,7 @@ def get_dashboard():
         </style>
     </head>
     <body>
-        <h1>ELF Dashboard <span class="mode-badge">Mode: {MODE}</span></h1>
+        <h1>ELF Dashboard <span class="mode-badge">Mode: {MODE}</span> <span class="mode-badge" style="background:#3498db">Client: {client_id}</span></h1>
 
         <h2>Memory Statistics</h2>
         <div class="stats-grid">
@@ -611,7 +802,7 @@ def get_dashboard():
             {heuristics_rows if heuristics_rows else '<tr><td colspan="6"><em>No heuristics yet. Run some jobs to start learning!</em></td></tr>'}
         </table>
 
-        <p class="refresh-note">Refresh the page to see updated statistics. Data is stored in ~/.claude/emergent-learning/memory/index.db</p>
+        <p class="refresh-note">Refresh the page to see updated statistics. Data is stored in ~/.claude/elf/{client_id}/memory.db</p>
     </body>
     </html>
     """

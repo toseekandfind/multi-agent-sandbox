@@ -79,13 +79,14 @@ A multi-agent orchestration system supporting both **VPS (primary)** and **AWS (
 
 ## What You Need
 
-Before deploying, have these ready:
+| Item | For `agent_farm` | For `claude_chat`/`analytics` |
+|------|------------------|-------------------------------|
+| **VPS** | ✅ Required | ✅ Required |
+| **Claude Code CLI** | ✅ Required (run `claude login`) | ❌ Not used |
+| **Anthropic API Key** | ❌ Not needed | ✅ Required |
+| **GitHub Token** | Only for private repos | Only for private repos |
 
-| Item | Description | Where to Get |
-|------|-------------|--------------|
-| **VPS** | Ubuntu 22.04+, 4+ cores, 8GB RAM | VPS-Mart, DigitalOcean, Hetzner, etc. |
-| **Anthropic API Key** | For Claude API calls | [console.anthropic.com](https://console.anthropic.com) |
-| **GitHub Token** | For cloning private repos (optional) | [github.com/settings/tokens](https://github.com/settings/tokens) |
+**Most users only need:** VPS + Claude Code CLI (Max subscription)
 
 ---
 
@@ -97,13 +98,15 @@ Before deploying, have these ready:
 # SSH to your VPS
 ssh root@your-vps-ip
 
-# Run the setup script (update URL with your GitHub username)
-curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/multi-agent-sandbox/main/infra/vps/setup.sh | bash
+# Clone and run setup (use your repo URL)
+git clone https://github.com/OWNER/multi-agent-sandbox.git /opt/multi-agent-sandbox
+cd /opt/multi-agent-sandbox && bash infra/vps/setup.sh
 
-# Configure credentials
-sudo nano /opt/multi-agent-sandbox/.env
-# Add: ANTHROPIC_API_KEY=sk-ant-...
-# Add: GITHUB_TOKEN=ghp_...  (optional, for private repos)
+# Authenticate Claude Code CLI
+claude login
+
+# (Optional) Add API key only if using claude_chat/analytics jobs
+echo "ANTHROPIC_API_KEY=sk-ant-..." | sudo tee -a /opt/multi-agent-sandbox/.env
 
 # Start services
 sudo systemctl start agent-orchestrator
@@ -267,45 +270,47 @@ docker build -t worker worker/
 
 ## Job Types
 
-| Type | Description | Modes |
-|------|-------------|-------|
-| `echo` | Test job - returns payload | All |
-| `claude_chat` | Single Claude API call | All |
-| `analytics` | Analytics/dbt workflow | All |
-| `agent_farm` | Multi-agent coordination via Claude Code instances | **VPS only** |
+| Type | What It Does | Requires | Modes |
+|------|--------------|----------|-------|
+| `echo` | Test job - returns payload | Nothing | All |
+| `claude_chat` | Single prompt → response | **Anthropic API key** | All |
+| `analytics` | Read files, call Claude, write output | **Anthropic API key** | All |
+| `agent_farm` | Multi-agent orchestration in tmux | **Claude Code CLI** (Max subscription) | VPS only |
 
-> **Note:** The `agent_farm` job type requires tmux and Claude Code CLI, which are only available in VPS mode (or local machines with both installed).
+### Job Type Details
 
-### Example Jobs
+#### `agent_farm` (Primary)
+Spawns multiple Claude Code CLI agents in tmux panes to work on a codebase together. This is the main feature.
+
+- **Uses:** Claude Code CLI with your Max subscription
+- **No API key needed** - authenticates via `claude login`
+- **Requires:** VPS with tmux installed
 
 ```bash
-# Echo test
 curl -X POST http://localhost:8000/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"job_type": "echo", "payload": {"message": "Hello"}}'
+  -d '{"job_type": "agent_farm", "payload": {"path": "/workspace/project", "agent_count": 3}}'
+```
 
-# Claude chat
-curl -X POST http://localhost:8000/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "job_type": "claude_chat",
-    "payload": {
-      "prompt": "Explain Docker in one paragraph",
-      "max_tokens": 200
-    }
-  }'
+#### `claude_chat` (Simple)
+Single API call to Claude. Prompt in, response out. No file editing, no agentic behavior.
 
-# Agent Farm - multi-agent coordination
+- **Uses:** Anthropic API directly
+- **Requires:** `ANTHROPIC_API_KEY` in `.env`
+
+```bash
 curl -X POST http://localhost:8000/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "job_type": "agent_farm",
-    "payload": {
-      "path": "/path/to/your/project",
-      "agent_count": 3,
-      "skip_commit": true
-    }
-  }'
+  -d '{"job_type": "claude_chat", "payload": {"prompt": "Explain Docker in one paragraph"}}'
+```
+
+#### `analytics` (dbt/SQL)
+Reads files from a repo, builds context, calls Claude for analytics work, writes output files.
+
+- **Uses:** Anthropic API directly
+- **Requires:** `ANTHROPIC_API_KEY` in `.env`
+
+```bash
+curl -X POST http://localhost:8000/jobs \
+  -d '{"job_type": "analytics", "payload": {"task": "Create a revenue model", "repo": "client_dbt"}}'
 ```
 
 ---
@@ -331,7 +336,43 @@ Absorbed from [Emergent-Learning-Framework_ELF](https://github.com/Spacehunterz/
 - **Pheromone trails** for file activity tracking
 - **Golden rules** for high-confidence patterns
 - **Dashboard** for visualization
-- **Workflow orchestration** with the conductor
+
+#### How ELF Works
+
+ELF is **pure SQLite storage** - it doesn't call any API.
+
+| Stage | What Happens |
+|-------|--------------|
+| **After jobs** | ELF records: outcome (success/failure), files touched, duration, errors |
+| **Before jobs** | ELF injects learned patterns into agent prompts |
+| **Over time** | Patterns validated repeatedly become "golden rules" (90%+ confidence) |
+
+#### ELF Integration by Job Type
+
+| Job Type | Records Outcomes | Gets ELF Context |
+|----------|------------------|------------------|
+| `agent_farm` | ✅ Yes | ✅ Yes (via prompt injection) |
+| `claude_chat` | ✅ Yes | ✅ Yes |
+| `analytics` | ✅ Yes | ✅ Yes |
+
+For `agent_farm`, ELF context is automatically injected into the agent prompt file. This means agents start each session with knowledge of:
+- **Golden Rules**: High-confidence patterns (90%+) that should always be followed
+- **Learned Patterns**: Heuristics from previous sessions with confidence scores
+- **Recent Issues**: Failed jobs to avoid repeating mistakes
+
+To disable ELF context injection for a specific job, set `"inject_elf_context": false` in the payload.
+
+#### Viewing Learned Patterns
+
+```bash
+# Dashboard (visual)
+open http://your-vps:8000/dashboard
+
+# API endpoints
+curl http://your-vps:8000/elf/stats
+curl http://your-vps:8000/elf/heuristics
+curl http://your-vps:8000/elf/golden-rules
+```
 
 ---
 
@@ -355,6 +396,92 @@ Absorbed from [Emergent-Learning-Framework_ELF](https://github.com/Spacehunterz/
 
 ```
 QUEUED → RUNNING → SUCCEEDED | FAILED
+```
+
+---
+
+## Multi-Tenant Setup
+
+Run multiple clients on a single VPS with complete isolation.
+
+### How It Works
+
+```
+VPS
+├── /workspace/
+│   ├── client-a/           ← Client A's workspaces
+│   │   └── job-abc123/
+│   └── client-b/           ← Client B's workspaces
+│       └── job-def456/
+├── ~/.claude/elf/
+│   ├── client-a/memory.db  ← Client A's learnings
+│   └── client-b/memory.db  ← Client B's learnings
+└── /etc/agent-sandbox/clients.json  ← API key → client mapping
+```
+
+### Enable Authentication
+
+1. Create a clients config file:
+
+```bash
+sudo mkdir -p /etc/agent-sandbox
+sudo tee /etc/agent-sandbox/clients.json << 'EOF'
+{
+    "sk-client-a-secret-key-here": "client-a",
+    "sk-client-b-secret-key-here": "client-b"
+}
+EOF
+sudo chmod 600 /etc/agent-sandbox/clients.json
+```
+
+2. Enable authentication:
+
+```bash
+# Add to .env
+AUTH_ENABLED=true
+```
+
+3. Restart the orchestrator:
+
+```bash
+sudo systemctl restart agent-orchestrator
+```
+
+### Using API Keys
+
+```bash
+# Submit job as client-a
+curl -X POST http://your-vps:8000/jobs \
+  -H "X-API-Key: sk-client-a-secret-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{"job_type": "agent_farm", "payload": {"path": "/workspace/project"}}'
+
+# View client-a's jobs only
+curl http://your-vps:8000/jobs \
+  -H "X-API-Key: sk-client-a-secret-key-here"
+
+# View client-a's ELF dashboard
+curl http://your-vps:8000/dashboard \
+  -H "X-API-Key: sk-client-a-secret-key-here"
+```
+
+### Isolation Guarantees
+
+| Resource | Isolation |
+|----------|-----------|
+| **Workspaces** | `/workspace/{client_id}/` |
+| **ELF Database** | `~/.claude/elf/{client_id}/memory.db` |
+| **Jobs** | Only visible to owning client |
+| **Agents** | Only visible to owning client |
+| **Golden Rules** | Per-client, not shared |
+
+### Without Authentication
+
+If `AUTH_ENABLED=false` (default), all requests use `client_id: "default"`:
+
+```bash
+# No API key needed
+curl http://your-vps:8000/jobs
 ```
 
 ---

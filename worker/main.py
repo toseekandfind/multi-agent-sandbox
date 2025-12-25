@@ -494,6 +494,58 @@ def setup_workspace(job_id: str, repo_url: str, branch: str = "main") -> str:
     return str(workspace)
 
 
+def generate_elf_prompt_file(payload: dict, original_prompt_file: str = None) -> str:
+    """
+    Generate a prompt file that includes ELF context.
+
+    If an original prompt file is specified, the ELF context is prepended.
+    Otherwise, a standalone ELF context file is created.
+
+    Returns:
+        Path to the generated prompt file, or None if no context available.
+    """
+    elf_context = get_elf_context(payload)
+    if not elf_context:
+        return original_prompt_file  # No ELF context, use original
+
+    # Build the combined prompt
+    prompt_parts = []
+
+    # Add ELF context header
+    prompt_parts.append("""
+## Learned Context from Previous Sessions
+
+The following patterns and rules have been learned from previous work on this project.
+Apply these insights where relevant to improve your work.
+
+""")
+    prompt_parts.append(elf_context)
+    prompt_parts.append("\n\n---\n\n")
+
+    # If there's an original prompt file, append its contents
+    if original_prompt_file:
+        original_path = Path(original_prompt_file)
+        if original_path.exists():
+            prompt_parts.append(original_path.read_text())
+            print(f"[{WORKER_ID}] Combined ELF context with prompt: {original_prompt_file}")
+        else:
+            print(f"[{WORKER_ID}] Warning: Original prompt file not found: {original_prompt_file}")
+
+    # Write to a temp file in the workspace
+    import tempfile
+    with tempfile.NamedTemporaryFile(
+        mode='w',
+        suffix='_elf_prompt.txt',
+        delete=False,
+        prefix='agent_farm_'
+    ) as f:
+        f.write("".join(prompt_parts))
+        temp_path = f.name
+
+    print(f"[{WORKER_ID}] Generated ELF-enhanced prompt file: {temp_path}")
+    return temp_path
+
+
 def handle_agent_farm_job(job_id: str, payload: dict) -> dict:
     """
     Agent Farm job handler - orchestrates multiple Claude Code agents.
@@ -511,6 +563,7 @@ def handle_agent_farm_job(job_id: str, payload: dict) -> dict:
         skip_commit: bool - Skip git commit/push (default: True for safety)
         stagger: float - Seconds between starting agents (default: 10.0)
         context_threshold: int - Restart when context <= this % (default: 20)
+        inject_elf_context: bool - Inject ELF learned context (default: True)
     """
     # Import Agent Farm here to avoid circular imports
     sys.path.insert(0, str(Path(__file__).parent.parent / "agent_farm"))
@@ -528,6 +581,14 @@ def handle_agent_farm_job(job_id: str, payload: dict) -> dict:
     else:
         raise ValueError("Either 'path' or 'repo_url' must be provided")
 
+    # Generate ELF-enhanced prompt file if enabled (default: True)
+    elf_prompt_file = None
+    if payload.get("inject_elf_context", True):
+        original_prompt = payload.get("prompt_file")
+        elf_prompt_file = generate_elf_prompt_file(payload, original_prompt)
+        if elf_prompt_file and elf_prompt_file != original_prompt:
+            print(f"[{WORKER_ID}] ELF context will be injected into agents")
+
     # Extract configuration from payload
     agent_count = int(payload.get("agent_count", 3))
     session_name = payload.get("session", f"job-{job_id[:8]}")
@@ -535,6 +596,10 @@ def handle_agent_farm_job(job_id: str, payload: dict) -> dict:
     print(f"[{WORKER_ID}] Starting Agent Farm with {agent_count} agents")
     print(f"[{WORKER_ID}] Project path: {project_path}")
     print(f"[{WORKER_ID}] Session: {session_name}")
+
+    # Determine which prompt file to use
+    # Priority: ELF-enhanced prompt > original prompt_file from payload
+    final_prompt_file = elf_prompt_file if elf_prompt_file else payload.get("prompt_file")
 
     # Create the orchestrator
     farm = ClaudeAgentFarm(
@@ -549,7 +614,7 @@ def handle_agent_farm_job(job_id: str, payload: dict) -> dict:
         auto_restart=payload.get("auto_restart", False),
         no_monitor=payload.get("no_monitor", False),
         attach=False,  # Never attach in job mode
-        prompt_file=payload.get("prompt_file"),
+        prompt_file=final_prompt_file,
         config=payload.get("config"),
         context_threshold=int(payload.get("context_threshold", 20)),
         idle_timeout=int(payload.get("idle_timeout", 60)),
@@ -578,6 +643,7 @@ def handle_agent_farm_job(job_id: str, payload: dict) -> dict:
             "problems_fixed": farm.total_problems_fixed,
             "commits_made": farm.total_commits_made,
             "agent_restarts": farm.agent_restart_count,
+            "elf_context_injected": elf_prompt_file is not None and elf_prompt_file != payload.get("prompt_file"),
             "processed_by": WORKER_ID,
             "processed_at": datetime.utcnow().isoformat(),
         }
@@ -611,6 +677,14 @@ def handle_agent_farm_job(job_id: str, payload: dict) -> dict:
             farm.shutdown()
         except Exception:
             pass
+
+        # Clean up temp ELF prompt file if we created one
+        if elf_prompt_file and elf_prompt_file != payload.get("prompt_file"):
+            try:
+                Path(elf_prompt_file).unlink(missing_ok=True)
+                print(f"[{WORKER_ID}] Cleaned up temp ELF prompt file")
+            except Exception:
+                pass
 
     print(f"[{WORKER_ID}] Agent Farm job complete: {result.get('status')}")
     return result
