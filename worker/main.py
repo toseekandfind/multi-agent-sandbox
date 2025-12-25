@@ -623,6 +623,8 @@ def handle_agent_farm_job(job_id: str, payload: dict) -> dict:
         tmux_mouse=True,
         fast_start=payload.get("fast_start", False),
         full_backup=payload.get("full_backup", False),
+        claude_cmd=payload.get("claude_cmd", "claude --dangerously-skip-permissions"),
+        min_run_time=int(payload.get("min_run_time", 0)),
     )
 
     start_time = datetime.utcnow()

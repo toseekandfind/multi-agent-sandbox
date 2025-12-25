@@ -311,14 +311,18 @@ class AgentMonitor:
         """Check if Claude Code is ready for input"""
         # Multiple possible indicators that Claude is ready
         ready_indicators = [
-            "Welcome to Claude Code!" in content,  # Welcome message
+            "Welcome to Claude Code!" in content,  # Welcome message (legacy)
+            "Welcome back" in content,  # New welcome message for returning users
             ("│ > Try" in content),  # The prompt box with suggestion
+            ("> Try" in content),  # The prompt suggestion without box chars
             ("? for shortcuts" in content),  # Shortcuts hint at bottom
             ("╰─" in content and "│ >" in content),  # Box structure with prompt
             ("/help for help" in content),  # Help text in welcome message
             ("cwd:" in content and "Welcome to Claude" in content),  # Working directory shown
             ("Bypassing Permissions" in content and "│ >" in content),  # May appear with prompt
             ("│ >" in content and "─╯" in content),  # Prompt box bottom border
+            "bypass permissions on" in content,  # Bypass mode indicator
+            "⏵⏵ bypass permissions" in content,  # Bypass mode with indicator
         ]
         return any(ready_indicators)
 
@@ -634,9 +638,13 @@ class ClaudeAgentFarm:
         fast_start: bool = False,
         full_backup: bool = False,
         commit_every: Optional[int] = None,
+        claude_cmd: str = "claude --dangerously-skip-permissions",
+        min_run_time: int = 0,  # Minimum seconds to run before completing (useful with no_monitor)
     ):
         # Store all parameters
         self.path = path
+        self.claude_cmd = claude_cmd
+        self.min_run_time = min_run_time
         self.agents = agents
         self.session = session
         self.stagger = stagger
@@ -1681,10 +1689,12 @@ class ClaudeAgentFarm:
 
         lock_acquired = True
         try:
-            tmux_send(pane_target, "cc")
+            # Use configurable claude command (defaults to 'cc' alias, but can be overridden)
+            claude_cmd = getattr(self, 'claude_cmd', 'claude --dangerously-skip-permissions')
+            tmux_send(pane_target, claude_cmd)
 
             if not restart:
-                console.print(f"🛠  Agent {agent_id:02d}: launching cc, waiting {self.wait_after_cc}s...")
+                console.print(f"🛠  Agent {agent_id:02d}: launching {claude_cmd[:20]}..., waiting {self.wait_after_cc}s...")
 
             # Make wait_after_cc interruptible
             for _ in range(int(self.wait_after_cc * 5)):
@@ -1695,6 +1705,18 @@ class ClaudeAgentFarm:
             # Always release lock
             if lock_acquired:
                 self._release_claude_lock()
+
+        # Check for and handle bypass permissions dialog
+        content = tmux_capture(pane_target)
+        if "Bypass Permissions mode" in content or "Yes, I accept" in content:
+            console.print(f"[yellow]Agent {agent_id:02d}: Accepting bypass permissions dialog...[/yellow]")
+            # Press Down to select "Yes, I accept" then Enter
+            tmux_send(pane_target, "", enter=False)  # Ensure focus
+            time.sleep(0.2)
+            run(f"tmux send-keys -t {pane_target} Down", quiet=True)
+            time.sleep(0.2)
+            run(f"tmux send-keys -t {pane_target} Enter", quiet=True)
+            time.sleep(2.0)  # Wait for Claude Code to fully start after accepting
 
         # Verify Claude Code started successfully
         max_retries = 5
@@ -1919,6 +1941,19 @@ class ClaudeAgentFarm:
         if self.no_monitor:
             console.print("[yellow]Monitoring disabled. Agents will run without supervision.[/yellow]")
             console.print(f"[cyan]Attach with: tmux attach -t {self.session}[/cyan]")
+
+            # If min_run_time is set, wait for that duration to let agents work
+            min_run_time = getattr(self, 'min_run_time', 0)
+            if min_run_time > 0:
+                console.print(f"[cyan]Waiting {min_run_time} seconds for agents to work...[/cyan]")
+                # Wait in 5-second intervals to allow graceful interruption
+                elapsed = 0
+                while elapsed < min_run_time and self.running:
+                    time.sleep(min(5, min_run_time - elapsed))
+                    elapsed += 5
+                    if elapsed % 30 == 0:  # Progress every 30 seconds
+                        console.print(f"[dim]  {elapsed}/{min_run_time}s elapsed...[/dim]")
+                console.print(f"[green]✓ Minimum run time ({min_run_time}s) completed[/green]")
             return
 
         console.rule("[green]All agents launched - Monitoring active")
