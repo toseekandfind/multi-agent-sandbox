@@ -48,8 +48,32 @@ else:
 
 WORKER_ID = os.getenv("HOSTNAME", f"worker-{os.getpid()}")
 
+# ELF Memory configuration
+ELF_ENABLED = os.getenv("ELF_ENABLED", "true").lower() == "true"
+ELF_DB_PATH = os.getenv("ELF_DB_PATH", None)  # Uses default if not set
+
 # Anthropic client (lazy loaded)
 _anthropic_client = None
+
+# ELF Memory (lazy loaded)
+_elf_memory = None
+
+
+def get_elf_memory():
+    """Get ELF memory interface (lazy loaded)."""
+    global _elf_memory
+    if not ELF_ENABLED:
+        return None
+    if _elf_memory is None:
+        try:
+            sys.path.insert(0, str(Path(__file__).parent.parent / "elf"))
+            from memory import ELFMemory
+            _elf_memory = ELFMemory(db_path=ELF_DB_PATH)
+            print(f"[{WORKER_ID}] ELF memory initialized")
+        except Exception as e:
+            print(f"[{WORKER_ID}] Warning: Could not initialize ELF memory: {e}")
+            return None
+    return _elf_memory
 
 
 def get_anthropic_client():
@@ -163,6 +187,75 @@ def upload_result_to_s3(job_id: str, result: dict):
     print(f"[{WORKER_ID}] Uploaded result to s3://{S3_BUCKET}/jobs/{job_id}/result.json")
 
 
+def get_elf_context(payload: dict) -> str:
+    """
+    Get ELF context for a job based on payload.
+
+    Returns formatted context string to inject into prompts.
+    """
+    memory = get_elf_memory()
+    if not memory:
+        return ""
+
+    try:
+        project_path = payload.get("path") or payload.get("repo")
+        domain = payload.get("domain")
+        files = payload.get("files_to_read", [])
+
+        context = memory.get_context(
+            project_path=project_path,
+            domain=domain,
+            files=files
+        )
+
+        if context.get("prompt_context"):
+            print(f"[{WORKER_ID}] ELF context loaded: {len(context['golden_rules'])} golden rules, {len(context['heuristics'])} heuristics")
+            return context["prompt_context"]
+    except Exception as e:
+        print(f"[{WORKER_ID}] Warning: Could not load ELF context: {e}")
+
+    return ""
+
+
+def record_elf_outcome(
+    job_id: str,
+    job_type: str,
+    payload: dict,
+    result: dict,
+    success: bool,
+    duration_seconds: float = None,
+    error_message: str = None
+):
+    """Record job outcome to ELF memory."""
+    memory = get_elf_memory()
+    if not memory:
+        return
+
+    try:
+        project_path = payload.get("path") or payload.get("repo")
+
+        # Extract files touched from result if available
+        files_touched = result.get("files_written", []) or result.get("files_modified", [])
+
+        # Extract learnings if any
+        learnings = result.get("learnings", [])
+
+        memory.record_outcome(
+            job_id=job_id,
+            job_type=job_type,
+            outcome="success" if success else "failure",
+            project_path=project_path,
+            duration_seconds=duration_seconds,
+            agent_count=payload.get("agent_count"),
+            files_touched=files_touched if files_touched else None,
+            learnings=learnings if learnings else None,
+            error_message=error_message
+        )
+        print(f"[{WORKER_ID}] ELF outcome recorded: {job_type} -> {'success' if success else 'failure'}")
+    except Exception as e:
+        print(f"[{WORKER_ID}] Warning: Could not record ELF outcome: {e}")
+
+
 def handle_echo_job(job_id: str, payload: dict) -> dict:
     """Echo handler - returns the payload with metadata."""
     message = payload.get("message", "")
@@ -188,6 +281,7 @@ def handle_claude_chat_job(job_id: str, payload: dict) -> dict:
         system: str (optional) - System prompt
         max_tokens: int (optional) - Max response tokens (default 1024)
         model: str (optional) - Model to use (default claude-sonnet-4-20250514)
+        domain: str (optional) - Domain for ELF context lookup
     """
     client = get_anthropic_client()
 
@@ -195,6 +289,11 @@ def handle_claude_chat_job(job_id: str, payload: dict) -> dict:
     system = payload.get("system", "You are a helpful assistant.")
     max_tokens = int(payload.get("max_tokens", 1024))  # Convert Decimal to int
     model = payload.get("model", "claude-sonnet-4-20250514")
+
+    # Inject ELF context if available
+    elf_context = get_elf_context(payload)
+    if elf_context:
+        system = f"{system}\n\n## Learned Context\n{elf_context}"
 
     print(f"[{WORKER_ID}] Calling Claude API with model {model}...")
 
@@ -290,6 +389,11 @@ When creating files, format your response with clear file markers like this:
 
 Always explain your reasoning before showing the files.
 After showing files, add an analysis section explaining what you built and how to verify it works."""
+
+    # Inject ELF context if available
+    elf_context = get_elf_context(payload)
+    if elf_context:
+        system_prompt = f"{system_prompt}\n\n## Learned Context\n{elf_context}"
 
     user_message = f"""Task: {task}
 
@@ -544,6 +648,9 @@ def process_job(job_id: str):
             # Update status
             update_job_status_aws(job_id, "SUCCEEDED", result)
 
+            # Record ELF outcome
+            record_elf_outcome(job_id, job_type, payload, result, success=True)
+
         except Exception as e:
             import traceback
             error_result = {
@@ -556,6 +663,9 @@ def process_job(job_id: str):
             update_job_status_aws(job_id, "FAILED", error_result)
             print(f"[{WORKER_ID}] Job {job_id} failed: {e}")
             print(f"[{WORKER_ID}] Traceback: {traceback.format_exc()}")
+
+            # Record ELF outcome
+            record_elf_outcome(job_id, job_type, payload, error_result, success=False, error_message=str(e))
 
     elif MODE == "vps":
         # VPS mode: SQLite + local file storage
@@ -592,6 +702,9 @@ def process_job(job_id: str):
             update_job_status_vps(job_id, "SUCCEEDED", result)
             update_agent_status_vps(job_id, "complete")
 
+            # Record ELF outcome
+            record_elf_outcome(job_id, job_type, payload, result, success=True)
+
         except Exception as e:
             import traceback
             error_result = {
@@ -605,6 +718,9 @@ def process_job(job_id: str):
             update_agent_status_vps(job_id, "error")
             print(f"[{WORKER_ID}] Job {job_id} failed: {e}")
             print(f"[{WORKER_ID}] Traceback: {traceback.format_exc()}")
+
+            # Record ELF outcome
+            record_elf_outcome(job_id, job_type, payload, error_result, success=False, error_message=str(e))
 
     else:
         # Local mode: Redis
@@ -633,6 +749,9 @@ def process_job(job_id: str):
 
             update_job_status_redis(job_id, "SUCCEEDED", result)
 
+            # Record ELF outcome
+            record_elf_outcome(job_id, job_type, payload, result, success=True)
+
         except Exception as e:
             error_result = {
                 "error": str(e),
@@ -641,6 +760,9 @@ def process_job(job_id: str):
             }
             update_job_status_redis(job_id, "FAILED", error_result)
             print(f"[{WORKER_ID}] Job {job_id} failed: {e}")
+
+            # Record ELF outcome
+            record_elf_outcome(job_id, job_type, payload, error_result, success=False, error_message=str(e))
 
 
 def poll_sqs():

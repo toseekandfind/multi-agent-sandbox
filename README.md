@@ -77,6 +77,96 @@ A multi-agent orchestration system supporting both **VPS (primary)** and **AWS (
 
 ---
 
+## What You Need
+
+Before deploying, have these ready:
+
+| Item | Description | Where to Get |
+|------|-------------|--------------|
+| **VPS** | Ubuntu 22.04+, 4+ cores, 8GB RAM | VPS-Mart, DigitalOcean, Hetzner, etc. |
+| **Anthropic API Key** | For Claude API calls | [console.anthropic.com](https://console.anthropic.com) |
+| **GitHub Token** | For cloning private repos (optional) | [github.com/settings/tokens](https://github.com/settings/tokens) |
+
+---
+
+## Quick Start (End-to-End)
+
+### Step 1: Provision & Setup VPS
+
+```bash
+# SSH to your VPS
+ssh root@your-vps-ip
+
+# Run the setup script (update URL with your GitHub username)
+curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/multi-agent-sandbox/main/infra/vps/setup.sh | bash
+
+# Configure credentials
+sudo nano /opt/multi-agent-sandbox/.env
+# Add: ANTHROPIC_API_KEY=sk-ant-...
+# Add: GITHUB_TOKEN=ghp_...  (optional, for private repos)
+
+# Start services
+sudo systemctl start agent-orchestrator
+sudo systemctl enable agent-orchestrator
+```
+
+### Step 2: Submit an Agent Farm Job
+
+```bash
+# Option A: Clone from GitHub and run agents
+curl -X POST http://your-vps:8000/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "job_type": "agent_farm",
+    "payload": {
+      "repo_url": "https://github.com/you/your-repo",
+      "branch": "main",
+      "agent_count": 3
+    }
+  }'
+
+# Option B: Use a repo already on the VPS
+curl -X POST http://your-vps:8000/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "job_type": "agent_farm",
+    "payload": {
+      "path": "/workspace/my-project",
+      "agent_count": 3
+    }
+  }'
+```
+
+### Step 3: Monitor Agents
+
+```bash
+# Watch agents work in real-time
+sudo -u agent tmux attach -t agents
+
+# Check job status via API
+curl http://your-vps:8000/jobs/{job_id}
+```
+
+### Step 4: Learning Over Time (ELF)
+
+The ELF memory layer tracks patterns across sessions:
+
+```
+Job 1: Agent fixes bug in auth.py
+       → ELF records: "auth.py often has token expiry issues"
+
+Job 2: Agent works on auth.py again
+       → ELF injects context: "Check token expiry (learned from Job 1)"
+       → Agent solves faster
+
+Job N: Pattern becomes a "golden rule"
+       → All future agents automatically receive this knowledge
+```
+
+View learned patterns at: `http://your-vps:8000/dashboard`
+
+---
+
 ## VPS Setup (Recommended)
 
 ### 1. Provision VPS
@@ -177,12 +267,14 @@ docker build -t worker worker/
 
 ## Job Types
 
-| Type | Description |
-|------|-------------|
-| `echo` | Test job - returns payload |
-| `claude_chat` | Single Claude API call |
-| `analytics` | Analytics/dbt workflow |
-| `agent_farm` | Multi-agent coordination via Claude Code instances |
+| Type | Description | Modes |
+|------|-------------|-------|
+| `echo` | Test job - returns payload | All |
+| `claude_chat` | Single Claude API call | All |
+| `analytics` | Analytics/dbt workflow | All |
+| `agent_farm` | Multi-agent coordination via Claude Code instances | **VPS only** |
+
+> **Note:** The `agent_farm` job type requires tmux and Claude Code CLI, which are only available in VPS mode (or local machines with both installed).
 
 ### Example Jobs
 
@@ -254,6 +346,10 @@ Absorbed from [Emergent-Learning-Framework_ELF](https://github.com/Spacehunterz/
 | GET | `/jobs/{job_id}` | All | Get job status |
 | GET | `/agents` | VPS | List all agents |
 | GET | `/agents/{agent_id}` | VPS | Get agent details |
+| GET | `/dashboard` | All | ELF Dashboard (HTML) |
+| GET | `/elf/stats` | All | ELF memory statistics |
+| GET | `/elf/heuristics` | All | Get learned heuristics |
+| GET | `/elf/golden-rules` | All | Get high-confidence rules |
 
 ### Job Status Flow
 

@@ -363,3 +363,257 @@ def get_agent(agent_id: str):
         raise HTTPException(status_code=404, detail="Agent not found")
 
     return dict(row)
+
+
+# ============================================================================
+# ELF Dashboard
+# ============================================================================
+
+# ELF Memory configuration
+ELF_DB_PATH = os.getenv("ELF_DB_PATH", None)
+_elf_memory = None
+
+
+def get_elf_memory():
+    """Get ELF memory interface (lazy loaded)."""
+    global _elf_memory
+    if _elf_memory is None:
+        try:
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent.parent / "elf"))
+            from memory import ELFMemory
+            _elf_memory = ELFMemory(db_path=ELF_DB_PATH)
+        except Exception as e:
+            print(f"Warning: Could not initialize ELF memory: {e}")
+            return None
+    return _elf_memory
+
+
+@app.get("/elf/stats")
+def get_elf_stats():
+    """Get ELF memory statistics."""
+    memory = get_elf_memory()
+    if not memory:
+        raise HTTPException(status_code=503, detail="ELF memory not available")
+
+    return memory.get_stats()
+
+
+@app.get("/elf/heuristics")
+def get_elf_heuristics(
+    domain: Optional[str] = None,
+    project_path: Optional[str] = None,
+    limit: int = 50
+):
+    """Get heuristics from ELF memory."""
+    memory = get_elf_memory()
+    if not memory:
+        raise HTTPException(status_code=503, detail="ELF memory not available")
+
+    return {
+        "heuristics": memory.get_heuristics(
+            domain=domain,
+            project_path=project_path,
+            limit=limit
+        )
+    }
+
+
+@app.get("/elf/golden-rules")
+def get_elf_golden_rules(project_path: Optional[str] = None):
+    """Get golden rules (high-confidence heuristics)."""
+    memory = get_elf_memory()
+    if not memory:
+        raise HTTPException(status_code=503, detail="ELF memory not available")
+
+    return {"golden_rules": memory.get_golden_rules(project_path=project_path)}
+
+
+from fastapi.responses import HTMLResponse
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def get_dashboard():
+    """ELF Dashboard - Visual interface for memory and learning."""
+    memory = get_elf_memory()
+
+    # Get stats
+    stats = memory.get_stats() if memory else {}
+
+    # Get recent heuristics
+    heuristics = memory.get_heuristics(limit=20) if memory else []
+
+    # Get golden rules
+    golden_rules = memory.get_golden_rules() if memory else []
+
+    # Build heuristics table rows
+    heuristics_rows = ""
+    for h in heuristics:
+        conf = h.get('confidence', 0) * 100
+        is_golden = "⭐" if h.get('is_golden') else ""
+        heuristics_rows += f"""
+        <tr>
+            <td>{is_golden}</td>
+            <td>{h.get('domain', 'general')}</td>
+            <td>{h.get('rule', '')[:80]}...</td>
+            <td>{conf:.0f}%</td>
+            <td>{h.get('times_validated', 0)}</td>
+            <td>{h.get('times_violated', 0)}</td>
+        </tr>
+        """
+
+    # Build golden rules list
+    golden_rules_html = ""
+    for r in golden_rules:
+        golden_rules_html += f"<li><strong>{r.get('domain', 'general')}:</strong> {r.get('rule', '')}</li>"
+
+    if not golden_rules_html:
+        golden_rules_html = "<li><em>No golden rules yet. Heuristics with 90%+ confidence become golden rules.</em></li>"
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>ELF Dashboard - Multi-Agent Sandbox</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            * {{ box-sizing: border-box; }}
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background: #f5f5f5;
+                color: #333;
+            }}
+            h1 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
+            h2 {{ color: #34495e; margin-top: 30px; }}
+            .stats-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                gap: 15px;
+                margin: 20px 0;
+            }}
+            .stat-card {{
+                background: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                text-align: center;
+            }}
+            .stat-value {{
+                font-size: 2em;
+                font-weight: bold;
+                color: #3498db;
+            }}
+            .stat-label {{
+                color: #7f8c8d;
+                margin-top: 5px;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                background: white;
+                border-radius: 8px;
+                overflow: hidden;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }}
+            th, td {{
+                padding: 12px 15px;
+                text-align: left;
+                border-bottom: 1px solid #eee;
+            }}
+            th {{
+                background: #3498db;
+                color: white;
+            }}
+            tr:hover {{
+                background: #f8f9fa;
+            }}
+            .golden-rules {{
+                background: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }}
+            .golden-rules ul {{
+                margin: 0;
+                padding-left: 20px;
+            }}
+            .golden-rules li {{
+                margin: 10px 0;
+                line-height: 1.5;
+            }}
+            .refresh-note {{
+                color: #7f8c8d;
+                font-size: 0.9em;
+                margin-top: 30px;
+            }}
+            .mode-badge {{
+                display: inline-block;
+                background: #27ae60;
+                color: white;
+                padding: 4px 12px;
+                border-radius: 20px;
+                font-size: 0.8em;
+                margin-left: 10px;
+            }}
+        </style>
+    </head>
+    <body>
+        <h1>ELF Dashboard <span class="mode-badge">Mode: {MODE}</span></h1>
+
+        <h2>Memory Statistics</h2>
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value">{stats.get('total_heuristics', 0)}</div>
+                <div class="stat-label">Total Heuristics</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats.get('golden_rules', 0)}</div>
+                <div class="stat-label">Golden Rules</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats.get('total_outcomes', 0)}</div>
+                <div class="stat-label">Job Outcomes</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats.get('successful_jobs', 0)}</div>
+                <div class="stat-label">Successful Jobs</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats.get('failed_jobs', 0)}</div>
+                <div class="stat-label">Failed Jobs</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats.get('active_trails', 0)}</div>
+                <div class="stat-label">Active Trails</div>
+            </div>
+        </div>
+
+        <h2>Golden Rules</h2>
+        <div class="golden-rules">
+            <ul>
+                {golden_rules_html}
+            </ul>
+        </div>
+
+        <h2>Learned Heuristics</h2>
+        <table>
+            <tr>
+                <th></th>
+                <th>Domain</th>
+                <th>Rule</th>
+                <th>Confidence</th>
+                <th>Validated</th>
+                <th>Violated</th>
+            </tr>
+            {heuristics_rows if heuristics_rows else '<tr><td colspan="6"><em>No heuristics yet. Run some jobs to start learning!</em></td></tr>'}
+        </table>
+
+        <p class="refresh-note">Refresh the page to see updated statistics. Data is stored in ~/.claude/emergent-learning/memory/index.db</p>
+    </body>
+    </html>
+    """
+
+    return html
