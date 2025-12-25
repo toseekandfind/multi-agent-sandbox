@@ -161,6 +161,7 @@ fi
 python3 -m pip install --upgrade pip
 python3 -m pip install -r worker/requirements.txt
 python3 -m pip install -r control_api/requirements.txt
+python3 -m pip install -r elf/mcp/requirements.txt
 
 log_success "Multi-agent-sandbox installed at ${REPO_DIR}"
 
@@ -346,4 +347,7 @@ echo "6. Submit a test job:"
 echo "   curl -X POST http://localhost:8000/jobs \\"
 echo "     -H 'Content-Type: application/json' \\"
 echo "     -d '{\"job_type\": \"echo\", \"payload\": {\"message\": \"Hello\"}}'"
+echo ""
+echo "7. (Optional) Add ELF MCP server to Claude Code for dynamic learning:"
+echo "   claude mcp add elf -- env CLIENT_ID=default python3 ${REPO_DIR}/elf/mcp/server.py"
 echo ""

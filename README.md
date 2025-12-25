@@ -362,6 +362,37 @@ For `agent_farm`, ELF context is automatically injected into the agent prompt fi
 
 To disable ELF context injection for a specific job, set `"inject_elf_context": false` in the payload.
 
+#### ELF MCP Server (Dynamic Access)
+
+For dynamic access during agent work, use the ELF MCP server:
+
+```bash
+# Add to Claude Code (one-time setup)
+claude mcp add elf -- env CLIENT_ID=default python3 /opt/multi-agent-sandbox/elf/mcp/server.py
+
+# For multi-tenant setup, use client-specific ID
+claude mcp add elf -- env CLIENT_ID=client-a python3 /opt/multi-agent-sandbox/elf/mcp/server.py
+```
+
+**Available MCP Tools:**
+
+| Tool | Purpose |
+|------|---------|
+| `elf_query` | Get context (golden rules, heuristics) |
+| `elf_search` | Search knowledge base |
+| `elf_record_heuristic` | Add new rule with confidence |
+| `elf_record_outcome` | Log job success/failure |
+| `elf_validate_heuristic` | Increase confidence of a rule |
+| `elf_violate_heuristic` | Decrease confidence of a rule |
+| `elf_record_plan` | Record task plan |
+| `elf_record_postmortem` | Compare expected vs actual outcome |
+| `elf_stats` | Get memory statistics |
+
+This allows agents to:
+- Query ELF mid-task: "What patterns do you know about auth.py?"
+- Record learnings in real-time as they discover them
+- Run plan/postmortem cycles for structured learning
+
 #### Viewing Learned Patterns
 
 ```bash
