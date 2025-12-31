@@ -620,7 +620,222 @@ def get_elf_golden_rules(client_id: str = Depends(get_client_id), project_path: 
     return {"client_id": client_id, "golden_rules": memory.get_golden_rules(project_path=project_path)}
 
 
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
+
+
+# ============================================================================
+# Workspace & Git Diff Endpoints (for pulling changes back)
+# ============================================================================
+
+@app.get("/workspace/diff")
+def get_workspace_diff(
+    path: str,
+    client_id: str = Depends(get_client_id)
+):
+    """
+    Get git diff of changes in a workspace directory.
+
+    Args:
+        path: Path to the workspace (relative to WORKSPACE_DIR or absolute)
+
+    Returns:
+        Git diff output showing all uncommitted changes
+    """
+    if MODE != "vps":
+        raise HTTPException(status_code=400, detail="Diff only available in VPS mode")
+
+    # Resolve path
+    if path.startswith("/"):
+        workspace_path = Path(path)
+    else:
+        workspace_path = Path(WORKSPACE_DIR) / client_id / path
+
+    if not workspace_path.exists():
+        raise HTTPException(status_code=404, detail=f"Workspace not found: {workspace_path}")
+
+    # Check if it's a git repo
+    git_dir = workspace_path / ".git"
+    if not git_dir.exists():
+        raise HTTPException(status_code=400, detail="Not a git repository")
+
+    # Get diff (staged + unstaged)
+    result = subprocess.run(
+        ["git", "diff", "HEAD"],
+        cwd=str(workspace_path),
+        capture_output=True,
+        text=True
+    )
+
+    # Also get untracked files
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=str(workspace_path),
+        capture_output=True,
+        text=True
+    )
+
+    return {
+        "path": str(workspace_path),
+        "diff": result.stdout,
+        "untracked_files": untracked.stdout.strip().split("\n") if untracked.stdout.strip() else [],
+        "has_changes": bool(result.stdout.strip() or untracked.stdout.strip())
+    }
+
+
+@app.get("/workspace/patch", response_class=PlainTextResponse)
+def get_workspace_patch(
+    path: str,
+    client_id: str = Depends(get_client_id)
+):
+    """
+    Generate a git patch file from all changes in workspace.
+
+    This creates commits for any uncommitted changes and generates
+    a format-patch that can be applied elsewhere.
+
+    Args:
+        path: Path to the workspace
+
+    Returns:
+        Git format-patch content (can be applied with `git am`)
+    """
+    if MODE != "vps":
+        raise HTTPException(status_code=400, detail="Patch only available in VPS mode")
+
+    # Resolve path
+    if path.startswith("/"):
+        workspace_path = Path(path)
+    else:
+        workspace_path = Path(WORKSPACE_DIR) / client_id / path
+
+    if not workspace_path.exists():
+        raise HTTPException(status_code=404, detail=f"Workspace not found: {workspace_path}")
+
+    # Get diff for patch (including staged and unstaged)
+    result = subprocess.run(
+        ["git", "diff", "HEAD"],
+        cwd=str(workspace_path),
+        capture_output=True,
+        text=True
+    )
+
+    if not result.stdout.strip():
+        return "# No changes to patch"
+
+    return result.stdout
+
+
+@app.get("/workspace/status")
+def get_workspace_status(
+    path: str,
+    client_id: str = Depends(get_client_id)
+):
+    """
+    Get git status of a workspace.
+
+    Args:
+        path: Path to the workspace
+
+    Returns:
+        Git status information including changed files
+    """
+    if MODE != "vps":
+        raise HTTPException(status_code=400, detail="Status only available in VPS mode")
+
+    # Resolve path
+    if path.startswith("/"):
+        workspace_path = Path(path)
+    else:
+        workspace_path = Path(WORKSPACE_DIR) / client_id / path
+
+    if not workspace_path.exists():
+        raise HTTPException(status_code=404, detail=f"Workspace not found: {workspace_path}")
+
+    # Get status
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(workspace_path),
+        capture_output=True,
+        text=True
+    )
+
+    # Get current branch
+    branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=str(workspace_path),
+        capture_output=True,
+        text=True
+    )
+
+    # Get last commit
+    last_commit = subprocess.run(
+        ["git", "log", "-1", "--format=%H %s"],
+        cwd=str(workspace_path),
+        capture_output=True,
+        text=True
+    )
+
+    # Parse status
+    files = []
+    for line in status.stdout.strip().split("\n"):
+        if line:
+            status_code = line[:2]
+            filename = line[3:]
+            files.append({"status": status_code.strip(), "file": filename})
+
+    return {
+        "path": str(workspace_path),
+        "branch": branch.stdout.strip(),
+        "last_commit": last_commit.stdout.strip(),
+        "changed_files": files,
+        "total_changes": len(files)
+    }
+
+
+@app.get("/workspace/file")
+def get_workspace_file(
+    path: str,
+    file: str,
+    client_id: str = Depends(get_client_id)
+):
+    """
+    Get contents of a specific file from workspace.
+
+    Args:
+        path: Path to the workspace
+        file: Relative path to the file within the workspace
+
+    Returns:
+        File contents
+    """
+    if MODE != "vps":
+        raise HTTPException(status_code=400, detail="File access only available in VPS mode")
+
+    # Resolve path
+    if path.startswith("/"):
+        workspace_path = Path(path)
+    else:
+        workspace_path = Path(WORKSPACE_DIR) / client_id / path
+
+    file_path = workspace_path / file
+
+    # Security: ensure file is within workspace
+    try:
+        file_path.resolve().relative_to(workspace_path.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied: path traversal detected")
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {file}")
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=400, detail="Path is not a file")
+
+    try:
+        content = file_path.read_text()
+        return {"file": file, "content": content, "size": len(content)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading file: {str(e)}")
 
 
 @app.get("/dashboard", response_class=HTMLResponse)

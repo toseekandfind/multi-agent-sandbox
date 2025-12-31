@@ -692,6 +692,188 @@ def handle_agent_farm_job(job_id: str, payload: dict) -> dict:
     return result
 
 
+def handle_dbt_run_job(job_id: str, payload: dict) -> dict:
+    """
+    dbt run job handler - executes dbt commands persistently on the VPS.
+
+    Payload:
+        dbt_project_path: str - Path to dbt project (e.g., "/workspace/analytics_dbt")
+        command: str - dbt command: "run", "build", "test", "compile", "retry" (default: "run")
+        target: str - dbt target profile (default: "dev")
+        select: str (optional) - dbt --select argument (models to include)
+        exclude: str (optional) - dbt --exclude argument (models to exclude)
+        full_refresh: bool (optional) - Run with --full-refresh flag
+        vars: dict (optional) - Variables to pass via --vars
+        profiles_dir: str (optional) - Custom profiles directory
+        threads: int (optional) - Number of threads to use
+        fail_fast: bool (optional) - Stop on first failure
+    """
+    from pathlib import Path
+    import select as sel
+
+    project_path = Path(payload.get("dbt_project_path", ""))
+    command = payload.get("command", "run")
+    target = payload.get("target", "dev")
+    select_arg = payload.get("select")
+    exclude = payload.get("exclude")
+    full_refresh = payload.get("full_refresh", False)
+    dbt_vars = payload.get("vars", {})
+    profiles_dir = payload.get("profiles_dir")
+    threads = payload.get("threads")
+    fail_fast = payload.get("fail_fast", False)
+
+    # Validate project path
+    if not project_path.exists():
+        raise FileNotFoundError(f"Project path not found: {project_path}")
+
+    dbt_project_file = project_path / "dbt_project.yml"
+    if not dbt_project_file.exists():
+        raise FileNotFoundError(f"dbt_project.yml not found at {project_path}")
+
+    print(f"[{WORKER_ID}] dbt_run job: dbt {command}")
+    print(f"[{WORKER_ID}] Project: {project_path}")
+    print(f"[{WORKER_ID}] Target: {target}")
+
+    # Build dbt command
+    cmd_parts = ["dbt", command]
+
+    if target:
+        cmd_parts.extend(["--target", target])
+
+    if select_arg:
+        cmd_parts.extend(["--select", select_arg])
+
+    if exclude:
+        cmd_parts.extend(["--exclude", exclude])
+
+    if full_refresh:
+        cmd_parts.append("--full-refresh")
+
+    if fail_fast:
+        cmd_parts.append("--fail-fast")
+
+    if threads:
+        cmd_parts.extend(["--threads", str(threads)])
+
+    if profiles_dir:
+        cmd_parts.extend(["--profiles-dir", profiles_dir])
+
+    if dbt_vars:
+        vars_json = json.dumps(dbt_vars)
+        cmd_parts.extend(["--vars", vars_json])
+
+    # Create output directory for logs
+    output_dir = Path(RESULTS_DIR) / job_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stdout_path = output_dir / "dbt_stdout.log"
+    stderr_path = output_dir / "dbt_stderr.log"
+
+    print(f"[{WORKER_ID}] Running: {' '.join(cmd_parts)}")
+    print(f"[{WORKER_ID}] Logs: {output_dir}")
+
+    start_time = datetime.utcnow()
+
+    # Build environment
+    env = os.environ.copy()
+    if profiles_dir:
+        env["DBT_PROFILES_DIR"] = profiles_dir
+
+    # Run dbt command with streaming output
+    with open(stdout_path, "w") as stdout_file, open(stderr_path, "w") as stderr_file:
+        process = subprocess.Popen(
+            cmd_parts,
+            cwd=str(project_path),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            bufsize=1,
+        )
+
+        stdout_lines = []
+        stderr_lines = []
+
+        # Stream output to files and collect for result
+        while True:
+            reads = [process.stdout, process.stderr]
+            ret = sel.select(reads, [], [], 1.0)
+
+            for fd in ret[0]:
+                if fd == process.stdout:
+                    line = fd.readline()
+                    if line:
+                        stdout_file.write(line)
+                        stdout_file.flush()
+                        stdout_lines.append(line.rstrip())
+                        if len(stdout_lines) % 20 == 0:
+                            print(f"[{WORKER_ID}] {stdout_lines[-1][:100]}")
+                elif fd == process.stderr:
+                    line = fd.readline()
+                    if line:
+                        stderr_file.write(line)
+                        stderr_file.flush()
+                        stderr_lines.append(line.rstrip())
+
+            if process.poll() is not None:
+                for line in process.stdout:
+                    stdout_file.write(line)
+                    stdout_lines.append(line.rstrip())
+                for line in process.stderr:
+                    stderr_file.write(line)
+                    stderr_lines.append(line.rstrip())
+                break
+
+    end_time = datetime.utcnow()
+    duration = (end_time - start_time).total_seconds()
+    exit_code = process.returncode
+    success = exit_code == 0
+
+    # Parse summary from output
+    import re
+    summary = {"pass": 0, "warn": 0, "error": 0, "skip": 0, "total": 0}
+    for line in stdout_lines[-50:]:
+        pass_match = re.search(r"(\d+)\s+(pass|PASS|OK)", line)
+        warn_match = re.search(r"(\d+)\s+(warn|WARN)", line)
+        error_match = re.search(r"(\d+)\s+(error|ERROR|FAIL)", line)
+        skip_match = re.search(r"(\d+)\s+(skip|SKIP)", line)
+        if pass_match:
+            summary["pass"] = int(pass_match.group(1))
+        if warn_match:
+            summary["warn"] = int(warn_match.group(1))
+        if error_match:
+            summary["error"] = int(error_match.group(1))
+        if skip_match:
+            summary["skip"] = int(skip_match.group(1))
+    summary["total"] = summary["pass"] + summary["warn"] + summary["error"] + summary["skip"]
+
+    result = {
+        "dbt_project": str(project_path),
+        "command": command,
+        "target": target,
+        "select": select_arg,
+        "exclude": exclude,
+        "exit_code": exit_code,
+        "success": success,
+        "duration_seconds": round(duration, 2),
+        "summary": summary,
+        "stdout_lines": len(stdout_lines),
+        "stderr_lines": len(stderr_lines),
+        "output_preview": "\n".join(stdout_lines[-30:]) if stdout_lines else "(no output)",
+        "error_preview": "\n".join(stderr_lines[-10:]) if stderr_lines else None,
+        "logs_dir": str(output_dir),
+        "processed_by": WORKER_ID,
+        "processed_at": datetime.utcnow().isoformat(),
+    }
+
+    status_msg = "SUCCESS" if success else "FAILED"
+    print(f"[{WORKER_ID}] dbt {command} {status_msg} in {duration:.1f}s")
+    if summary["total"] > 0:
+        print(f"[{WORKER_ID}] Summary: {summary['pass']} pass, {summary['error']} error, {summary['skip']} skip")
+
+    return result
+
+
 def process_job(job_id: str):
     """Process a single job."""
     if MODE == "aws":
@@ -715,6 +897,8 @@ def process_job(job_id: str):
                 result = handle_analytics_job(job_id, payload)
             elif job_type == "agent_farm":
                 result = handle_agent_farm_job(job_id, payload)
+            elif job_type == "dbt_run":
+                result = handle_dbt_run_job(job_id, payload)
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
@@ -768,6 +952,8 @@ def process_job(job_id: str):
                 result = handle_analytics_job(job_id, payload)
             elif job_type == "agent_farm":
                 result = handle_agent_farm_job(job_id, payload)
+            elif job_type == "dbt_run":
+                result = handle_dbt_run_job(job_id, payload)
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
