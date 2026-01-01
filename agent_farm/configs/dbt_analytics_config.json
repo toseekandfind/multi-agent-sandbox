@@ -1,0 +1,87 @@
+{
+  "comment": "Configuration for dbt Analytics Engineering projects with Lead/Worker/Reviewer agent roles",
+  "tech_stack": "dbt_analytics",
+  "problem_commands": {
+    "compile": ["dbt", "compile", "--target", "dev"],
+    "build": ["dbt", "build", "--select", "state:modified+", "--target", "dev"],
+    "test": ["dbt", "test", "--select", "state:modified+", "--target", "dev"],
+    "verify": ["./scripts/verify"]
+  },
+  "file_patterns": {
+    "models": ["models/**/*.sql", "models/**/*.yml"],
+    "tests": ["tests/**/*.sql", "tests/**/*.yml"],
+    "macros": ["macros/**/*.sql"],
+    "seeds": ["seeds/**/*.csv", "seeds/**/*.yml"],
+    "snapshots": ["snapshots/**/*.sql"]
+  },
+  "agent_roles": {
+    "lead": {
+      "prompt_file": "prompts/dbt_agent_lead.txt",
+      "responsibilities": [
+        "Own workflow guardrails",
+        "Coordinate worker and reviewer agents",
+        "Enforce branching strategy",
+        "Quality gates and merge decisions"
+      ]
+    },
+    "worker": {
+      "prompt_file": "prompts/dbt_worker_agent.txt",
+      "responsibilities": [
+        "Implement dbt changes on feature branch",
+        "Run local verification",
+        "Commit and push changes",
+        "Address review feedback"
+      ]
+    },
+    "reviewer": {
+      "prompt_file": "prompts/dbt_review_agent.txt",
+      "responsibilities": [
+        "Review PR diffs",
+        "Check for risky git actions",
+        "Verify guardrails are met",
+        "Approve or request changes"
+      ]
+    }
+  },
+  "workflow": {
+    "branching": "main-only",
+    "branch_pattern": "feature/<ticket>-<slug>",
+    "merge_strategy": "squash",
+    "required_checks": [
+      "ci/dbt-compile",
+      "ci/dbt-build-scoped",
+      "ci/dbt-test-scoped"
+    ]
+  },
+  "guardrails": {
+    "no_direct_push_to_main": true,
+    "no_force_push": true,
+    "require_ticket_reference": true,
+    "require_ci_pass": true,
+    "require_reviewer_approval": true,
+    "no_full_project_build": true,
+    "no_snapshot_full_refresh": true,
+    "no_hardcoded_credentials": true
+  },
+  "chunk_size": 25,
+  "agents": 3,
+  "session": "dbt_agents",
+  "stagger": 5.0,
+  "wait_after_cc": 10.0,
+  "check_interval": 10,
+  "skip_regenerate": false,
+  "skip_commit": false,
+  "auto_restart": true,
+  "no_monitor": false,
+  "attach": false,
+  "context_threshold": 20,
+  "idle_timeout": 60,
+  "max_errors": 3,
+  "git_branch": "main",
+  "git_remote": "origin",
+  "tmux_kill_on_exit": true,
+  "tmux_mouse": true,
+  "fast_start": false,
+  "full_backup": false,
+  "max_agents": 10
+}

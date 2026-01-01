@@ -263,3 +263,137 @@ If CI schemas accumulate:
 1. Check if upstream models exist in CI schema
 2. Verify selector includes all dependencies (`+model+` not just `model`)
 3. Check for missing seeds that need to be run first
+
+## Agent-Assisted Workflow
+
+This repo supports multi-agent orchestration for dbt workflows using three specialized agent roles.
+
+### Agent Roles
+
+| Role | Prompt File | Responsibilities |
+|------|-------------|------------------|
+| **Lead** | `agent_farm/prompts/dbt_agent_lead.txt` | Owns guardrails, coordinates worker & reviewer |
+| **Worker** | `agent_farm/prompts/dbt_worker_agent.txt` | Implements changes on feature branch |
+| **Reviewer** | `agent_farm/prompts/dbt_review_agent.txt` | Reviews PRs, checks for risky actions |
+
+### Workflow Sequence
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      LEAD AGENT                              │
+│  - Receives task                                            │
+│  - Creates task breakdown                                   │
+│  - Enforces guardrails                                      │
+└─────────────────┬───────────────────────┬───────────────────┘
+                  │                       │
+                  ▼                       ▼
+┌─────────────────────────┐   ┌─────────────────────────┐
+│     WORKER AGENT        │   │     REVIEWER AGENT      │
+│  - Creates feature      │   │  - Reviews PR diff      │
+│    branch               │──▶│  - Checks guardrails    │
+│  - Implements changes   │   │  - Approves or requests │
+│  - Runs ./scripts/verify│   │    changes              │
+│  - Commits and pushes   │   │                         │
+└─────────────────────────┘   └─────────────────────────┘
+                  │                       │
+                  └───────────┬───────────┘
+                              ▼
+                  ┌─────────────────────────┐
+                  │      LEAD AGENT         │
+                  │  - Merges if approved   │
+                  │  - Reports completion   │
+                  └─────────────────────────┘
+```
+
+### Using Agents via VPS
+
+Submit an agent workflow job to the VPS:
+
+```bash
+# Single agent (e.g., just worker)
+curl -X POST http://151.243.109.200:8000/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "job_type": "agent_farm",
+    "payload": {
+      "repo": "/path/to/dbt/project",
+      "prompt_file": "prompts/dbt_worker_agent.txt",
+      "config_file": "configs/dbt_analytics_config.json",
+      "task": "Add a new dim_products model with tests"
+    }
+  }'
+```
+
+### Using Agents Locally
+
+Run the agent farm directly:
+
+```bash
+cd agent_farm
+
+# Run with dbt config
+python claude_code_agent_farm.py \
+  --config configs/dbt_analytics_config.json \
+  --prompt prompts/dbt_worker_agent.txt \
+  --repo /path/to/dbt/project \
+  --agents 1
+```
+
+### Agent Guardrails
+
+All agents enforce these rules (configured in `dbt_analytics_config.json`):
+
+| Guardrail | Description |
+|-----------|-------------|
+| `no_direct_push_to_main` | All changes via feature branch + PR |
+| `no_force_push` | Never rewrite shared history |
+| `require_ticket_reference` | Commits must reference tickets |
+| `require_ci_pass` | CI must pass before merge |
+| `require_reviewer_approval` | Reviewer agent must approve |
+| `no_full_project_build` | Always use scoped selectors |
+| `no_snapshot_full_refresh` | No --full-refresh without approval |
+| `no_hardcoded_credentials` | All secrets via env_var() |
+
+### Example: Full Workflow
+
+1. **Lead receives task**: "Add customer lifetime value to dim_customers"
+
+2. **Lead delegates to Worker**:
+   ```
+   WORKER TASK:
+   - Branch: feature/AE-123-add-customer-ltv
+   - Objective: Add ltv_amount and ltv_segment columns
+   - Files: models/marts/dim_customers.sql, models/marts/schema.yml
+   - Run: ./scripts/verify before commit
+   ```
+
+3. **Worker implements**:
+   ```bash
+   git checkout -b feature/AE-123-add-customer-ltv
+   # ... makes changes ...
+   ./scripts/verify  # passes
+   git commit -m "[AE-123] Add customer LTV columns"
+   git push -u origin feature/AE-123-add-customer-ltv
+   ```
+
+4. **Lead triggers Reviewer**:
+   ```
+   REVIEW REQUEST:
+   - PR: feature/AE-123-add-customer-ltv
+   - Changes: 2 files, adds 2 columns + tests
+   ```
+
+5. **Reviewer checks and approves**:
+   ```
+   REVIEW APPROVED:
+   - CI passed: YES
+   - Guardrails verified: YES
+   - Ready to merge: YES
+   ```
+
+6. **Lead merges**:
+   ```bash
+   git checkout main
+   git merge --squash feature/AE-123-add-customer-ltv
+   git push origin main
+   ```
