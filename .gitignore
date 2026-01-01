@@ -42,3 +42,6 @@ Thumbs.db
 
 # Local testing
 *.pid
+
+# Config with secrets
+config/vps.json
