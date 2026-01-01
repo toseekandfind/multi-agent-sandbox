@@ -1,0 +1,204 @@
+# Example profiles.yml with CI target
+#
+# Copy this to your dbt project and customize for your warehouse.
+# Store sensitive values in environment variables, not in the file.
+#
+# Required environment variables for CI:
+#   - DBT_CI_SCHEMA: Set dynamically per PR (e.g., ci_123_abc1234)
+#   - Warehouse-specific credentials (see sections below)
+
+# =============================================================================
+# Snowflake Configuration
+# =============================================================================
+# Required env vars:
+#   SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD,
+#   SNOWFLAKE_ROLE, SNOWFLAKE_WAREHOUSE
+
+my_snowflake_project:
+  target: dev
+  outputs:
+    # Development target - for local development
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      database: analytics_dev
+      schema: "{{ env_var('DBT_SCHEMA', 'dbt_' ~ env_var('USER', 'dev')) }}"
+      threads: 4
+
+    # CI target - isolated schema per PR
+    ci:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      database: analytics_ci  # Separate CI database
+      schema: "{{ env_var('DBT_CI_SCHEMA') }}"  # Set per PR: ci_<pr>_<sha>
+      threads: 4
+
+    # Production target - read-only for most users
+    prod:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      database: analytics
+      schema: core
+      threads: 8
+
+
+# =============================================================================
+# BigQuery Configuration
+# =============================================================================
+# Required env vars:
+#   GOOGLE_APPLICATION_CREDENTIALS (path to service account JSON)
+#   GCP_PROJECT (your GCP project ID)
+
+my_bigquery_project:
+  target: dev
+  outputs:
+    # Development target
+    dev:
+      type: bigquery
+      method: service-account
+      project: "{{ env_var('GCP_PROJECT') }}"
+      dataset: "{{ env_var('DBT_SCHEMA', 'dbt_dev') }}"
+      threads: 4
+      timeout_seconds: 300
+      location: US
+      priority: interactive
+
+    # CI target - isolated dataset per PR
+    ci:
+      type: bigquery
+      method: service-account
+      project: "{{ env_var('GCP_PROJECT') }}_ci"  # Separate CI project
+      dataset: "{{ env_var('DBT_CI_SCHEMA') }}"   # Set per PR: ci_<pr>_<sha>
+      threads: 4
+      timeout_seconds: 300
+      location: US
+      priority: batch  # Use batch for CI to save costs
+
+    # Production target
+    prod:
+      type: bigquery
+      method: service-account
+      project: "{{ env_var('GCP_PROJECT') }}"
+      dataset: analytics
+      threads: 8
+      timeout_seconds: 600
+      location: US
+      priority: interactive
+
+
+# =============================================================================
+# Databricks Configuration
+# =============================================================================
+# Required env vars:
+#   DATABRICKS_HOST, DATABRICKS_TOKEN, DATABRICKS_HTTP_PATH
+
+my_databricks_project:
+  target: dev
+  outputs:
+    # Development target
+    dev:
+      type: databricks
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      catalog: dev_catalog
+      schema: "{{ env_var('DBT_SCHEMA', 'dbt_dev') }}"
+      threads: 4
+
+    # CI target - isolated schema per PR
+    ci:
+      type: databricks
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      catalog: ci_catalog  # Separate CI catalog
+      schema: "{{ env_var('DBT_CI_SCHEMA') }}"  # Set per PR: ci_<pr>_<sha>
+      threads: 4
+
+    # Production target
+    prod:
+      type: databricks
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      catalog: prod_catalog
+      schema: analytics
+      threads: 8
+
+
+# =============================================================================
+# Multi-Warehouse Configuration (for projects supporting multiple warehouses)
+# =============================================================================
+# Use this pattern if your dbt project needs to work with multiple warehouses.
+# Set DBT_PROFILE_TARGET to switch between them.
+
+multi_warehouse_project:
+  target: "{{ env_var('DBT_PROFILE_TARGET', 'snowflake_dev') }}"
+  outputs:
+    snowflake_dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      database: analytics_dev
+      schema: "{{ env_var('DBT_SCHEMA', 'dbt_dev') }}"
+      threads: 4
+
+    snowflake_ci:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      database: analytics_ci
+      schema: "{{ env_var('DBT_CI_SCHEMA') }}"
+      threads: 4
+
+    bigquery_dev:
+      type: bigquery
+      method: service-account
+      project: "{{ env_var('GCP_PROJECT') }}"
+      dataset: "{{ env_var('DBT_SCHEMA', 'dbt_dev') }}"
+      threads: 4
+      location: US
+
+    bigquery_ci:
+      type: bigquery
+      method: service-account
+      project: "{{ env_var('GCP_PROJECT') }}_ci"
+      dataset: "{{ env_var('DBT_CI_SCHEMA') }}"
+      threads: 4
+      location: US
+
+    databricks_dev:
+      type: databricks
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      catalog: dev_catalog
+      schema: "{{ env_var('DBT_SCHEMA', 'dbt_dev') }}"
+      threads: 4
+
+    databricks_ci:
+      type: databricks
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      catalog: ci_catalog
+      schema: "{{ env_var('DBT_CI_SCHEMA') }}"
+      threads: 4

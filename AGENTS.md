@@ -98,6 +98,79 @@ aws ecs describe-services --cluster agent-runner --services orchestrator \
 
 ---
 
+## Branching and PR Workflow
+
+This project follows a **main-only workflow** with feature branch PRs.
+
+### Branch Naming Convention
+
+All feature branches must follow this pattern:
+```
+feature/<ticket-id>-<short-slug>
+```
+
+Examples:
+- `feature/AE-123-add-customer-dim`
+- `feature/JIRA-456-fix-revenue-calc`
+- `feature/GH-789-add-ci-smoke-tests`
+
+### PR Flow to Main
+
+1. **Create feature branch** from `main`:
+   ```bash
+   git checkout main
+   git pull origin main
+   git checkout -b feature/<ticket>-<slug>
+   ```
+
+2. **Make changes** and commit with clear messages
+
+3. **Push and open PR** to `main`:
+   ```bash
+   git push -u origin feature/<ticket>-<slug>
+   ```
+
+4. **Address review feedback** via commits on the same branch (do not open new PRs)
+
+5. **Squash merge** once approved
+
+### Commit and Merge Rules
+
+- **No direct pushes to main** - main is protected
+- **All changes via PR** - even small fixes
+- **All feedback addressed via commits on same branch** - no new PRs for review fixes
+- **Prefer squash merge** - one commit per feature/fix
+
+### Squash Commit Message Format
+
+When squash merging, the commit message must include:
+
+```
+[TICKET-123] Short summary of change
+
+Data Impact: <describe schema changes, grain changes, expected row deltas>
+Rollback: <steps to revert if needed>
+```
+
+Example:
+```
+[AE-456] Add customer lifetime value to dim_customers
+
+Data Impact: Adds 2 new columns (ltv_amount, ltv_segment). No grain change.
+             Existing rows will have NULL for historical periods.
+Rollback: Revert commit and run dbt build --select dim_customers
+```
+
+### Agent Roles for dbt Projects
+
+| Role | Responsibilities |
+|------|-----------------|
+| **Agent Lead** | Owns workflow docs + guardrails, coordinates worker + reviewer agents |
+| **Worker Agent** | Implements repo changes on feature branch, adds scripts and CI updates |
+| **Review Agent** | Reviews PR diffs, checks for risky git actions and missing guardrails |
+
+---
+
 ## Common Tasks
 
 ### Local Development Only
