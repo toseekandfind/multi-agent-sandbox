@@ -27,6 +27,26 @@ The dbt MCP server should ONLY be used for:
 ### dbt Execution Strategy
 Use the VPS worker to execute dbt commands. See VPS section below.
 
+## Local vs VPS Architecture
+
+**Local Claude Code = Orchestrator/Monitor**
+- Monitors VPS worker status and job results
+- Reviews changes before committing to GitHub
+- Makes decisions about what jobs to submit
+- Handles user interaction and approvals
+
+**VPS Worker = Execution Engine**
+- Executes all heavy workloads (dbt runs, agent spawning, code analysis)
+- ALWAYS use VPS for prompts and agent work
+- Cannot push to GitHub directly (sandboxed for safety)
+- Reports results back to local orchestrator
+
+### Rule: VPS-First for Execution
+Always submit work to VPS rather than running locally unless:
+1. It's a quick one-line query
+2. The VPS is unavailable
+3. User explicitly requests local execution
+
 ## VPS Worker (CONFIGURED)
 
 The VPS is set up and ready to use for job execution.
@@ -61,7 +81,29 @@ curl http://151.243.109.200:8000/jobs
 - `agent_farm` - Spawn N Claude Code agents in parallel
 - `dbt_run` - Run dbt commands in a workspace
 
+### dbt_run Job Payload
+```json
+{
+  "job_type": "dbt_run",
+  "payload": {
+    "dbt_project_path": "/opt/workspaces/analytics_dbt",
+    "command": "run",           // run, build, test, compile, retry
+    "target": "databricks",     // target profile name
+    "select": "model_name",     // optional: --select argument
+    "exclude": "other_model",   // optional: --exclude argument
+    "full_refresh": true,       // optional: adds --full-refresh
+    "fail_fast": false          // optional: adds --fail-fast
+  }
+}
+```
+
 ### Sandbox Security
 - VPS agents CANNOT push to GitHub (git remote operations blocked)
 - Changes are retrieved via `/workspace/diff` and `/workspace/patch` endpoints
 - Orchestrator (local Claude Code) pulls changes and asks user before committing
+
+### Troubleshooting VPS Issues
+1. **Check worker health**: `curl http://151.243.109.200:8000/health`
+2. **Check logs**: `ssh agent-vps "tail -50 /var/log/worker.log"`
+3. **Restart worker**: `ssh agent-vps "pkill -f 'python.*main.py'; cd /opt/multi-agent-sandbox && MODE=vps nohup python3 worker/main.py >> /var/log/worker.log 2>&1 &"`
+4. **Check job status**: `curl http://151.243.109.200:8000/jobs/{job_id}`

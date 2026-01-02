@@ -698,7 +698,9 @@ def handle_dbt_run_job(job_id: str, payload: dict) -> dict:
 
     Payload:
         dbt_project_path: str - Path to dbt project (e.g., "/workspace/analytics_dbt")
+        workspace_path: str - Alias for dbt_project_path (for backwards compatibility)
         command: str - dbt command: "run", "build", "test", "compile", "retry" (default: "run")
+                       Can also be a full command string like "dbt run --select X --full-refresh"
         target: str - dbt target profile (default: "dev")
         select: str (optional) - dbt --select argument (models to include)
         exclude: str (optional) - dbt --exclude argument (models to exclude)
@@ -710,10 +712,50 @@ def handle_dbt_run_job(job_id: str, payload: dict) -> dict:
     """
     from pathlib import Path
     import select as sel
+    import shlex
 
-    project_path = Path(payload.get("dbt_project_path", ""))
+    # Accept both dbt_project_path and workspace_path for flexibility
+    project_path_str = payload.get("dbt_project_path") or payload.get("workspace_path") or ""
+    project_path = Path(project_path_str)
+
     command = payload.get("command", "run")
     target = payload.get("target", "dev")
+
+    # Handle full command strings like "dbt run --select X --full-refresh --target databricks"
+    # Parse the command string to extract components
+    if command.startswith("dbt "):
+        parts = shlex.split(command)
+        # Extract subcommand (run, build, test, etc.)
+        if len(parts) > 1:
+            command = parts[1]  # e.g., "run"
+        # Parse additional flags from command string
+        i = 2
+        while i < len(parts):
+            if parts[i] == "--select" and i + 1 < len(parts):
+                if not payload.get("select"):
+                    payload["select"] = parts[i + 1]
+                i += 2
+            elif parts[i] == "--target" and i + 1 < len(parts):
+                target = parts[i + 1]
+                i += 2
+            elif parts[i] == "--full-refresh":
+                payload["full_refresh"] = True
+                i += 1
+            elif parts[i] == "--exclude" and i + 1 < len(parts):
+                if not payload.get("exclude"):
+                    payload["exclude"] = parts[i + 1]
+                i += 2
+            elif parts[i] == "--fail-fast":
+                payload["fail_fast"] = True
+                i += 1
+            elif parts[i] == "--threads" and i + 1 < len(parts):
+                payload["threads"] = int(parts[i + 1])
+                i += 2
+            elif parts[i] == "--profiles-dir" and i + 1 < len(parts):
+                payload["profiles_dir"] = parts[i + 1]
+                i += 2
+            else:
+                i += 1
     select_arg = payload.get("select")
     exclude = payload.get("exclude")
     full_refresh = payload.get("full_refresh", False)
