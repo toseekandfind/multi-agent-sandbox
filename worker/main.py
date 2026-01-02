@@ -9,6 +9,25 @@ from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
+# Load .env file if exists (for secrets like DBT_DATABRICKS_TOKEN)
+def load_env_file():
+    env_paths = [
+        Path(__file__).parent.parent / ".env",  # /opt/multi-agent-sandbox/.env
+        Path.home() / ".env",
+    ]
+    for env_path in env_paths:
+        if env_path.exists():
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        if key not in os.environ:  # Don't override existing
+                            os.environ[key] = value
+            break
+
+load_env_file()
+
 # Mode: "local" (Redis), "aws" (SQS + DynamoDB + S3), or "vps" (SQLite + local files)
 MODE = os.getenv("MODE", "local")
 
