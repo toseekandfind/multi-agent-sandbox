@@ -97,13 +97,45 @@ curl http://151.243.109.200:8000/jobs
 }
 ```
 
+### agent_farm Job Payload
+**IMPORTANT:** Use `path` and `task`, NOT `workspace_path` or `prompt`!
+```json
+{
+  "job_type": "agent_farm",
+  "payload": {
+    "path": "/opt/workspaces/analytics_dbt",   // REQUIRED: local project path
+    "task": "Description of what to do...",     // REQUIRED: natural language task
+    "agent_count": 1,                           // Number of agents (default: 3)
+    "branch": "main",                           // Git branch (default: main)
+    "auto_restart": false,                      // Auto-restart on errors
+    "skip_commit": true,                        // Skip git commit (default: true)
+    "stagger": 10.0                             // Seconds between agent starts
+  }
+}
+```
+
+Common mistakes to avoid:
+- ❌ `workspace_path` → ✅ `path`
+- ❌ `prompt` → ✅ `task`
+- ❌ `num_agents` → ✅ `agent_count`
+
 ### Sandbox Security
 - VPS agents CANNOT push to GitHub (git remote operations blocked)
 - Changes are retrieved via `/workspace/diff` and `/workspace/patch` endpoints
 - Orchestrator (local Claude Code) pulls changes and asks user before committing
 
+### VPS User Requirements
+**IMPORTANT:** The worker must run as the `agent` user, NOT root!
+- Claude Code's `--dangerously-skip-permissions` flag doesn't work as root
+- The `agent` user exists on the VPS at `/home/agent`
+- Workspaces should be owned by `agent:agent`
+
 ### Troubleshooting VPS Issues
 1. **Check worker health**: `curl http://151.243.109.200:8000/health`
 2. **Check logs**: `ssh agent-vps "tail -50 /var/log/worker.log"`
-3. **Restart worker**: `ssh agent-vps "pkill -f 'python.*main.py'; cd /opt/multi-agent-sandbox && MODE=vps nohup python3 worker/main.py >> /var/log/worker.log 2>&1 &"`
+3. **Restart worker (as agent user)**:
+   ```bash
+   ssh agent-vps "pkill -f 'python.*main.py'; su - agent -c 'cd /opt/multi-agent-sandbox && MODE=vps nohup python3 worker/main.py >> /var/log/worker.log 2>&1 &'"
+   ```
 4. **Check job status**: `curl http://151.243.109.200:8000/jobs/{job_id}`
+5. **Fix workspace permissions**: `ssh agent-vps "chown -R agent:agent /opt/workspaces"`

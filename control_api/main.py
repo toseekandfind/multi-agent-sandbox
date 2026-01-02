@@ -499,9 +499,16 @@ def list_jobs(client_id: str = Depends(get_client_id), limit: int = 50):
             for row in cursor.fetchall():
                 job = dict(row)
                 if job.get("payload"):
-                    job["payload"] = json.loads(job["payload"])
+                    try:
+                        job["payload"] = json.loads(job["payload"])
+                    except json.JSONDecodeError:
+                        job["payload"] = {"raw": job["payload"]}
                 if job.get("result"):
-                    job["result"] = json.loads(job["result"])
+                    try:
+                        job["result"] = json.loads(job["result"])
+                    except json.JSONDecodeError:
+                        # Handle non-JSON results (e.g., plain text error messages)
+                        job["result"] = {"message": job["result"]}
                 jobs.append(job)
         return {"jobs": jobs, "count": len(jobs), "client_id": client_id}
     else:
